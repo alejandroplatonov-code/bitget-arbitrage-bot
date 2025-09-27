@@ -2,7 +2,7 @@
 trade_amount_usdt = 8
 
 # Минимальный чистый процентный спред для входа в сделку
-spread_threshold_percent = 0.5
+spread_threshold_percent = 0.3
 
 # Комиссия тейкера на бирже в процентах
 taker_fee_percent = 0.0

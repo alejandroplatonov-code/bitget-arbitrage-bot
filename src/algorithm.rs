@@ -131,77 +131,84 @@ async fn handle_open_position(
             };
 
         if let Some(reason) = close_reason {
-            // --- НАЧАЛО: Логика разделения режимов ---
-            // --- ЗАМЕНЕННЫЙ БЛОК ---
+            // --- НАЧАЛО: Логика разделения режимов для закрытия позиции ---
             if config.live_trading_enabled {
                 // Атомарно блокируем пару, чтобы не пытаться закрыть ее дважды
                 if !app_state.inner.executing_pairs.insert(symbol.to_string()) {
                     return;
                 }
-
+ 
                 info!("[{}] LIVE TRADING: Attempting to close position (Reason: {})...", symbol, reason);
-
+ 
                 // Генерируем уникальный ID для закрывающих ордеров
                 let client_oid = uuid::Uuid::new_v4().to_string();
-
+ 
                 // Формируем ордера на закрытие: продаем спот и откупаем фьючерс
-                // --- НОВЫЙ БЛОК: Округление ---
-                let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
-
-                // Округляем, ТОЛЬКО ЕСЛИ есть правило
-                let final_spot_qty = if let Some(scale) = rules.spot_quantity_scale {
-                    trading_logic::round_down(position.base_qty, scale)
-                } else {
-                    warn!("[{}] Spot quantity scale not found. Using unrounded value for closing.", symbol);
-                    position.base_qty // Правила нет - отправляем как есть
-                };
-                let final_fut_qty = if let Some(scale) = rules.futures_quantity_scale {
-                    trading_logic::round_down(position.base_qty, scale)
-                } else {
-                    warn!("[{}] Futures quantity scale not found. Using unrounded value for closing.", symbol);
-                    position.base_qty // Правила нет - отправляем как есть
-                };
-                // --- КОНЕЦ БЛОКА ---
-
+                // Используем `position.base_qty`, который хранит исполненный объем при входе.
+                // Округление здесь не требуется, так как мы продаем то, что уже купили.
                 let spot_order_req = PlaceOrderRequest {
                     symbol: position.symbol.clone(),
                     side: "sell".to_string(),
                     order_type: "market".to_string(),
-                    size: final_spot_qty.to_string(), // Продаем округленный или исходный объем
+                    size: position.base_qty.to_string(), // Продаем точный объем, который был куплен
                     client_oid: Some(client_oid.clone()),
                 };
                 let futures_order_req = PlaceFuturesOrderRequest {
                     symbol: position.symbol.clone(),
                     product_type: "USDT-FUTURES".to_string(),
                     margin_mode: "isolated".to_string(),
-                    margin_coin: "USDT".to_string(), // Откупаем округленный объем
-                    size: final_fut_qty.to_string(),
+                    margin_coin: "USDT".to_string(),
+                    size: position.base_qty.to_string(), // Откупаем точный объем, который был продан
                     side: "buy".to_string(),
                     trade_side: None, // Для one_way_mode
                     order_type: "market".to_string(),
                     client_oid: Some(client_oid.clone()),
                 };
-
+ 
                 // Запускаем исполнение в отдельной задаче
                 tokio::spawn({
                     let client = api_client.clone();
                     let order_tx = order_watch_tx.clone();
                     let symbol = symbol.to_string();
                     let app_state = app_state.clone();
-
+ 
                     async move {
                         let (spot_res, fut_res) = tokio::join!(
                             client.place_spot_order(spot_order_req),
                             client.place_futures_order(futures_order_req)
                         );
-
+ 
                         match (&spot_res, &fut_res) {
                             (Ok(spot_ord), Ok(fut_ord)) => {
                                 info!("[{}] Successfully sent CLOSE orders.", &symbol);
                                 // Отправляем на отслеживание с контекстом Exit
-                                let _ = order_tx.send(WatchOrderRequest { symbol: symbol.clone(), order_id: spot_ord.order_id.clone(), order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Exit }).await;
-                                let _ = order_tx.send(WatchOrderRequest { symbol: symbol.clone(), order_id: fut_ord.order_id.clone(), order_type: OrderType::Futures, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Exit }).await;
-                                // `PositionManager` обработает исполнение, удалит `ActivePosition` и снимет блокировку `executing_pairs`.
+                                let spot_watch_req = WatchOrderRequest {
+                                    symbol: symbol.clone(),
+                                    order_id: spot_ord.order_id.clone(),
+                                    order_type: OrderType::Spot,
+                                    client_oid: client_oid.clone(),
+                                    context: crate::order_watcher::OrderContext::Exit,
+                                };
+                                let fut_watch_req = WatchOrderRequest {
+                                    symbol: symbol.clone(),
+                                    order_id: fut_ord.order_id.clone(),
+                                    order_type: OrderType::Futures,
+                                    client_oid: client_oid.clone(),
+                                    context: crate::order_watcher::OrderContext::Exit,
+                                };
+ 
+                                if order_tx.send(spot_watch_req).await.is_err() {
+                                    error!("[{}] Failed to send CLOSE spot order to watcher.", &symbol);
+                                    // TODO: Критическая ошибка, нужна логика компенсации
+                                    app_state.inner.executing_pairs.remove(&symbol);
+                                }
+                                if order_tx.send(fut_watch_req).await.is_err() {
+                                    error!("[{}] Failed to send CLOSE futures order to watcher.", &symbol);
+                                    // TODO: Критическая ошибка, нужна логика компенсации
+                                    app_state.inner.executing_pairs.remove(&symbol);
+                                }
+                                // `PositionManager` обработает исполнение, удалит `ActivePosition`
+                                // и снимет блокировку `executing_pairs`.
                             },
                             _ => {
                                 error!("[{}] FAILED to send one or both CLOSE orders. Will retry. Spot: {:?}, Futures: {:?}", &symbol, spot_res, fut_res);
@@ -212,8 +219,6 @@ async fn handle_open_position(
                     }
                 });
             } else {
-            // --- КОНЕЦ ЗАМЕНЕННОГО БЛОКА ---
-            // --- КОНЕЦ: Логика разделения режимов ---
                 // *** ВИРТУАЛЬНЫЙ РЕЖИМ ***
                 if let Some((_key, pos_to_close)) = app_state.inner.active_positions.remove(symbol) {
                     let hundred = Decimal::from(100);
@@ -241,6 +246,7 @@ async fn handle_open_position(
                     );
                 }
             }
+            // --- КОНЕЦ: Логика разделения режимов для закрытия позиции ---
         }
     }
 }
