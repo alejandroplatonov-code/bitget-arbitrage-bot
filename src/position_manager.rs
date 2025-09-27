@@ -4,11 +4,10 @@ use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
 use dashmap::DashMap;
-use redis::AsyncCommands;
 use rust_decimal::{Decimal, prelude::FromStr};
 use std::sync::{Arc};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Основная функция, запускающая менеджер позиций.
 /// Он слушает события об исполнении ордеров и обновляет состояние позиций.

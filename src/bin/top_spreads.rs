@@ -69,11 +69,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let symbol = entry.key();
                 let pair_data = entry.value();
 
-                if let Some(sell_futures_res) = trading_logic::calculate_qty_for_target_revenue(&pair_data.futures_book.bids, trade_amount) {
-                    if let Some(buy_spot_res) = trading_logic::calculate_cost_to_acquire(&pair_data.spot_book.asks, sell_futures_res.total_base_qty) {
-                        if !buy_spot_res.total_quote_qty.is_zero() {
-                            let spread_percent = ((sell_futures_res.total_quote_qty - buy_spot_res.total_quote_qty) / buy_spot_res.total_quote_qty) * hundred;
-                            return Some((symbol.clone(), spread_percent));
+                // 1. Берем лучшую цену из стакана фьючерсов для расчета N.
+                // Это надежнее, чем ждать last_price из канала trades.
+                if let Some((&last_price, _)) = pair_data.futures_book.asks.iter().next() {
+                    if !last_price.is_zero() {
+                        let base_qty_n = trade_amount / last_price;
+
+                        // 2. Рассчитываем VWAP для этого N
+                        if let Some(sell_futures_res) = trading_logic::calculate_revenue_from_sale(&pair_data.futures_book.bids, base_qty_n) {
+                            if let Some(buy_spot_res) = trading_logic::calculate_cost_to_acquire(&pair_data.spot_book.asks, base_qty_n) {
+                                if !buy_spot_res.total_quote_qty.is_zero() {
+                                    // 3. Проверяем спред
+                                    let spread_percent = ((sell_futures_res.total_quote_qty - buy_spot_res.total_quote_qty) / buy_spot_res.total_quote_qty) * hundred;
+                                    return Some((symbol.clone(), spread_percent));
+                                }
+                            }
                         }
                     }
                 }

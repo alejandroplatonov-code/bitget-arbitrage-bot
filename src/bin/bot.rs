@@ -26,7 +26,9 @@ use serde::Deserialize;
 struct SpotSymbolInfo {
     symbol: String,
     #[serde(rename = "quantityScale")]
-    quantity_scale: Option<String>, // Make optional to handle missing fields from API
+    quantity_scale: Option<String>,
+    #[serde(rename = "priceScale")]
+    price_scale: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -92,21 +94,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     info!("[Bot] Starting data connectors for {} pairs.", trading_pairs.len());
 
+    // --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
     let spot_connector = BitgetConnector::new(
         "SPOT".to_string(),
         trading_pairs.clone(),
         app_state.inner.clone(),
-        vec!["books".to_string(), "trades".to_string()],
+        vec!["books".to_string(), "trades".to_string()], // <-- Добавлен "trades"
         orderbook_update_tx.clone(),
     );
 
+    // --- И ИЗМЕНЕНИЕ ЗДЕСЬ ---
     let futures_connector = BitgetConnector::new(
         "USDT-FUTURES".to_string(),
         trading_pairs,
         app_state.inner.clone(),
-        vec!["books".to_string(), "trades".to_string()],
+        vec!["books".to_string(), "trades".to_string()], // <-- Добавлен "trades"
         orderbook_update_tx,
     );
+    // --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
     // --- НОВЫЙ БЛОК: Механизм Graceful Shutdown ---
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_signal_task = {
@@ -162,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 8. Запуск основного алгоритма ---
     let algorithm_handle = tokio::spawn(run_trading_algorithm(
         app_state.clone(),
-        config.as_ref().clone(),
+        config.clone(), // <-- ИЗМЕНЕНИЕ: Просто клонируем Arc
         api_client.clone(),
         order_watch_tx,
         orderbook_update_rx, shutdown_notify.clone()
@@ -199,12 +205,26 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     let spot_symbols: Vec<SpotSymbolInfo> = serde_json::from_value(spot_rules_data["data"].clone())?;
 
     for spot_info in spot_symbols {
-        let mut rules = app_state.inner.symbol_rules.entry(spot_info.symbol).or_default();
-        // Если поле есть и парсится, записываем Some(scale), иначе остается None
-        rules.spot_quantity_scale = spot_info.quantity_scale.and_then(|s| s.parse().ok());
-        if rules.spot_quantity_scale.is_none() {
-            // Log if a trading pair is missing rules, it will be caught by verification later.
-            warn!("[RulesLoader] Spot symbol {} is missing 'quantityScale'.", rules.key());
+        let mut rules = app_state.inner.symbol_rules.entry(spot_info.symbol.clone()).or_default();
+        
+        // --- ИЗМЕНЕНИЕ: Логика с фолбэком для quantityScale и priceScale ---
+        match spot_info.quantity_scale.and_then(|s| s.parse::<u32>().ok()) {
+            Some(s) => rules.spot_quantity_scale = Some(s),
+            None => {
+                warn!("[RulesLoader] Spot symbol {} is missing 'quantityScale'. Using fallback scale of 6.", spot_info.symbol);
+                rules.spot_quantity_scale = Some(6);
+            }
+        }
+
+        match spot_info.price_scale.and_then(|s| s.parse::<u32>().ok()) {
+            Some(s) => rules.spot_price_scale = Some(s),
+            None => {
+                // Для USDT-пар цена - это USDT. Обычно у него 2-4 знака.
+                // Ошибка 40808 упоминает 8 знаков, что странно, но безопасно использовать как фолбэк.
+                // Это предотвратит ошибки, если API не вернет `priceScale`.
+                warn!("[RulesLoader] Spot symbol {} is missing 'priceScale'. Using fallback scale of 8.", spot_info.symbol);
+                rules.spot_price_scale = Some(8);
+            }
         }
     }
 
@@ -230,7 +250,7 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     let mut missing_rules_count = 0;
     for pair in trading_pairs {
         if let Some(rules) = app_state.inner.symbol_rules.get(&pair) {
-            if rules.spot_quantity_scale.is_none() || rules.futures_quantity_scale.is_none() {
+            if rules.spot_quantity_scale.is_none() || rules.futures_quantity_scale.is_none() || rules.spot_price_scale.is_none() {
                 warn!("[RulesLoader] Incomplete rules for {}: {:?}", pair, rules.value());
                 missing_rules_count += 1;
             }

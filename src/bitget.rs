@@ -1,11 +1,11 @@
 // src/connectors/bitget.rs
 
 use crate::orderbook::WsOrderBookData;
-use crate::state::AppState;
 use dashmap::DashMap;
+use rust_decimal::Decimal;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::str::FromStr;
 use tokio::{sync::mpsc, time::{interval, Duration}};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, trace};
@@ -30,20 +30,27 @@ struct SubscribeMessage {
 struct WsMessageWrapper {
     action: Option<String>,
     arg: WsMessageArg,
-    data: Option<Vec<WsOrderBookData>>,
+    data: Option<serde_json::Value>, // Используем Value для обработки разных типов данных (books или trades)
 }
 #[derive(Deserialize, Debug)]
 struct WsMessageArg {
     #[serde(rename = "instId")]
-    #[allow(dead_code)]
     inst_id: String,
+    channel: String, // Добавляем канал для различения books и trades
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct WsTradeData {
+    price: String,
+    // Нам нужна только цена, остальные поля (tradeId, size, side, ts) для этой задачи не используются.
 }
 
 // --- Обработчик для одной пары ("Worker") ---
 async fn pair_worker(
     symbol: String,
     inst_type: String,
-    app_state: AppState,
+    app_state: std::sync::Arc<crate::state::AppStateInner>,
     orderbook_update_tx: mpsc::Sender<String>,
     mut rx: mpsc::Receiver<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -54,43 +61,57 @@ async fn pair_worker(
 
     while let Some(msg_text) = rx.recv().await {
         if let Ok(msg) = serde_json::from_str::<WsMessageWrapper>(&msg_text) {
-            if let Some(data_vec) = msg.data {
-                if let Some(data) = data_vec.into_iter().next() {
-                    let mut pair_data = app_state.inner.market_data.entry(symbol.clone()).or_default();
-                    let book = if inst_type == "SPOT" { &mut pair_data.spot_book } else { &mut pair_data.futures_book };
+            if let Some(data_value) = msg.data {
+                match msg.arg.channel.as_str() {
+                    "books" => {
+                        if let Ok(data_vec) = serde_json::from_value::<Vec<WsOrderBookData>>(data_value) {
+                            if let Some(data) = data_vec.into_iter().next() {
+                                let mut pair_data = app_state.market_data.entry(symbol.clone()).or_default();
+                                let book = if inst_type == "SPOT" { &mut pair_data.spot_book } else { &mut pair_data.futures_book };
 
-                    match msg.action.as_deref() {
-                        Some("snapshot") => {
-                            book.apply_snapshot(&data);
-                            is_synced = true;
-                            info!("{} Synced from snapshot.", log_prefix);
-                            // --- ОТПРАВКА СИГНАЛА ---
-                            if orderbook_update_tx.try_send(symbol.clone()).is_err() {
-                                // Канал переполнен, ничего страшного
-                            }
-                        }
-                        Some("update") if is_synced => {
-                            // Сначала всегда применяем обновление
-                            book.apply_update(&data);
-
-                            // Затем, если checksum есть, валидируем стакан
-                            if let Some(server_checksum) = data.checksum {
-                                if let Err(e) = book.validate(server_checksum) {
-                                    // Если валидация провалилась, логируем ошибку
-                                    error!("{} {}", log_prefix, e);
-                                    
-                                    // Сбрасываем флаг, чтобы остановить обработку и ждать нового snapshot'a
-                                    is_synced = false; 
+                                match msg.action.as_deref() {
+                                    Some("snapshot") => {
+                                        book.apply_snapshot(&data);
+                                        is_synced = true;
+                                        info!("{} Synced from snapshot.", log_prefix);
+                                        if orderbook_update_tx.try_send(symbol.clone()).is_err() {
+                                            // Канал переполнен, ничего страшного
+                                        }
+                                    }
+                                    Some("update") if is_synced => {
+                                        book.apply_update(&data);
+                                        if let Some(server_checksum) = data.checksum {
+                                            if let Err(e) = book.validate(server_checksum) {
+                                                error!("{} {}", log_prefix, e);
+                                                is_synced = false; 
+                                            }
+                                        }
+                                        if orderbook_update_tx.try_send(symbol.clone()).is_err() {
+                                            // Канал переполнен, ничего страшного
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-
-                            // --- ОТПРАВКА СИГНАЛА ---
-                            if orderbook_update_tx.try_send(symbol.clone()).is_err() {
-                                // Канал переполнен, ничего страшного
+                        }
+                    },
+                    "trades" => {
+                        if let Ok(data_vec) = serde_json::from_value::<Vec<WsTradeData>>(data_value) {
+                            if let Some(trade_data) = data_vec.into_iter().next() {
+                                if let Ok(price) = Decimal::from_str(&trade_data.price) {
+                                    let mut pair_data = app_state.market_data.entry(symbol.clone()).or_default();
+                                    if inst_type == "SPOT" {
+                                        pair_data.spot_last_price = Some(price);
+                                    } else {
+                                        pair_data.futures_last_price = Some(price);
+                                    }
+                                }
                             }
                         }
-                        _ => {}
-                    }
+                    },
+                    _ => {
+                        trace!("{} Received message for unknown channel: {}", log_prefix, msg.arg.channel);
+                    },
                 }
             }
         }
@@ -99,99 +120,79 @@ async fn pair_worker(
 }
 
 // --- Основная структура коннектора ---
-// Теперь она просто хранит общие параметры
 pub struct BitgetConnector {
     inst_type: String,
     inst_ids: Vec<String>,
-    app_state: AppState,
-    channel: String,
+    app_state: std::sync::Arc<crate::state::AppStateInner>,
+    channels: Vec<String>, // Поддерживает несколько каналов (books, trades)
     orderbook_update_tx: mpsc::Sender<String>,
 }
 
 impl BitgetConnector {
     pub fn new(
         inst_type: String,
-        inst_ids: Vec<String>,
-        app_state: AppState,
-        channel: String,
+        inst_ids: Vec<String>,        
+        app_state: std::sync::Arc<crate::state::AppStateInner>,
+        channels: Vec<String>,
         orderbook_update_tx: mpsc::Sender<String>,
     ) -> Self {
-        Self { inst_type, inst_ids, app_state, channel, orderbook_update_tx }
+        Self { inst_type, inst_ids, app_state, channels, orderbook_update_tx }
     }
 
-    /// Управляет запуском нескольких соединений.
-    pub async fn run(&self) {
+    pub async fn run(self, shutdown: std::sync::Arc<tokio::sync::Notify>) {
         info!("[{}] Main connector manager starting for {} pairs.", self.inst_type, self.inst_ids.len());
-
-        // Устанавливаем, сколько пар будет на одно WebSocket соединение.
         const PAIRS_PER_CONNECTION: usize = 50;
-
         let mut tasks = tokio::task::JoinSet::new();
 
-        // Оптимизация: клонируем общие данные один раз перед циклом
-        let _app_state = self.app_state.clone();
-        let inst_type = self.inst_type.clone();
-        let _channel = self.channel.clone();
-
         for (i, chunk) in self.inst_ids.chunks(PAIRS_PER_CONNECTION).enumerate() {
-            // Создаем отдельный "суб-коннектор" для каждого пакета пар
             let sub_connector = SubConnector {
                 log_prefix: format!("[{}-{}]", self.inst_type, i + 1),
-                inst_type: inst_type.clone(),
+                inst_type: self.inst_type.clone(),
                 inst_ids: chunk.to_vec(),
                 app_state: self.app_state.clone(),
-                channel: self.channel.clone(),
+                channels: self.channels.clone(),
                 orderbook_update_tx: self.orderbook_update_tx.clone(),
             };
             
-            // Запускаем для него бесконечный цикл переподключений в отдельной задаче
+            let shutdown_for_task = shutdown.clone();
             tasks.spawn(async move {
-                sub_connector.run_connection_loop().await;
+                sub_connector.run_connection_loop(shutdown_for_task).await;
             });
         }
         
-        // Ожидаем завершения всех менеджеров (в теории, никогда)
         while let Some(res) = tasks.join_next().await {
             error!("[{}] A connection manager task unexpectedly finished: {:?}", self.inst_type, res);
         }
     }
 }
 
-// --- НОВАЯ СТРУКТУРА ДЛЯ ОДНОГО СОЕДИНЕНИЯ ---
+// --- Структура для одного соединения ---
 struct SubConnector {
     log_prefix: String,
     inst_type: String,
     inst_ids: Vec<String>,
-    app_state: AppState,
-    channel: String,
+    app_state: std::sync::Arc<crate::state::AppStateInner>,
+    channels: Vec<String>,
     orderbook_update_tx: mpsc::Sender<String>,
 }
 
 impl SubConnector {
-    /// Управляет циклом переподключений для одного соединения.
-    async fn run_connection_loop(&self) {
+    async fn run_connection_loop(&self, shutdown: std::sync::Arc<tokio::sync::Notify>) {
         loop {
             info!("{} Attempting to connect for {} pairs...", self.log_prefix, self.inst_ids.len());
-
-            let result = self.connect_and_process().await;
-
-            // Логируем ошибку, только если она есть
-            if let Err(e) = result {
+            if let Err(e) = self.connect_and_process(shutdown.clone()).await {
                 error!("{} Connector error: {}. Reconnecting...", self.log_prefix, e);
             }
-            tokio::time::sleep(Duration::from_secs(5)).await; // Задержка перед следующей попыткой
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 
-    /// Выполняет работу в рамках одного WebSocket соединения.
-    /// Этот код - это ваш предыдущий `connect_and_process` почти без изменений.
-    async fn connect_and_process(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_and_process(&self, shutdown: std::sync::Arc<tokio::sync::Notify>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (ws_stream, _) = connect_async(BITGET_WS_URL).await?;
         info!("{} WebSocket connection successful.", self.log_prefix);
         let (mut writer, mut reader) = ws_stream.split();
 
-        // Запуск worker'ов для пар ЭТОГО соединения
-        let worker_channels = Arc::new(DashMap::<String, mpsc::Sender<String>>::new());
+        let worker_channels = std::sync::Arc::new(DashMap::<String, mpsc::Sender<String>>::new());
         for symbol in &self.inst_ids {
             let (worker_tx, worker_rx) = mpsc::channel(128);
             worker_channels.insert(symbol.clone(), worker_tx);
@@ -204,18 +205,29 @@ impl SubConnector {
             ));
         }
         
-        // Подписка только на пары ЭТОГО соединения
-        let args: Vec<SubscribeArg> = self.inst_ids.iter().map(|id| SubscribeArg {
+        // --- ИЗМЕНЕНИЕ: Подписка на несколько каналов ---
+        // 1. Подписка на BOOKS
+        let books_args: Vec<SubscribeArg> = self.inst_ids.iter().map(|id| SubscribeArg {
             inst_type: self.inst_type.clone(),
-            channel: self.channel.clone(),
+            channel: "books".to_string(),
             inst_id: id.clone(),
         }).collect();
-        let sub_msg = SubscribeMessage { op: "subscribe".to_string(), args };
-        let payload = Message::Text(serde_json::to_string(&sub_msg)?);
-        writer.send(payload).await?;
-        info!("{} Subscription message sent.", self.log_prefix);
+        let books_sub_msg = SubscribeMessage { op: "subscribe".to_string(), args: books_args };
+        writer.send(Message::Text(serde_json::to_string(&books_sub_msg)?)).await?;
+        info!("{} Subscription message sent for 'books'.", self.log_prefix);
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
-        // Основной цикл с Ping/Pong и Диспетчером
+        // 2. Подписка на TRADES
+        let trades_args: Vec<SubscribeArg> = self.inst_ids.iter().map(|id| SubscribeArg {
+            inst_type: self.inst_type.clone(),
+            channel: "trades".to_string(),
+            inst_id: id.clone(),
+        }).collect();
+        let trades_sub_msg = SubscribeMessage { op: "subscribe".to_string(), args: trades_args };
+        writer.send(Message::Text(serde_json::to_string(&trades_sub_msg)?)).await?;
+        info!("{} Subscription message sent for 'trades'.", self.log_prefix);
+        // --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
         let mut ping_interval = interval(Duration::from_secs(25));
         loop {
             tokio::select! {
@@ -228,26 +240,15 @@ impl SubConnector {
                     match msg_result {
                         Some(Ok(Message::Text(text))) => {
                             if text == "pong" { continue; }
-                            // Быстрый поиск без полного парсинга. Ищем `"instId":"SYMBOL"`.
-                            if let Some(start) = text.find("\"instId\":\"") {
-                                let start = start + 10; // Смещаемся за кавычки
-                                if let Some(end) = text[start..].find('"') {
-                                    let symbol = &text[start..start + end];
-                                    if let Some(tx) = worker_channels.get(symbol) {
-                                        // `try_send` остается
-                                        match tx.try_send(text) {
-                                            Ok(_) => {
-                                                // Сообщение успешно и мгновенно отправлено
-                                            },
-                                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                                // Буфер worker'а полон, он не успевает.
-                                                // Это нормально для активных пар, просто пропускаем сообщение.
-                                                trace!("{} Worker for {} is lagging, dropping message.", self.log_prefix, symbol);
-                                            },
-                                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                // Worker завершил работу, его канал закрыт. Удаляем.
-                                                worker_channels.remove(symbol);
-                                            }
+                            if let Ok(wrapper) = serde_json::from_str::<WsMessageWrapper>(&text) {
+                                if let Some(tx) = worker_channels.get(&wrapper.arg.inst_id) {
+                                    match tx.try_send(text) {
+                                        Ok(_) => {},
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            trace!("{} Worker for {} is lagging, dropping message.", self.log_prefix, wrapper.arg.inst_id);
+                                        },
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            worker_channels.remove(&wrapper.arg.inst_id);
                                         }
                                     }
                                 }
@@ -257,6 +258,10 @@ impl SubConnector {
                         Some(Err(e)) => return Err(e.into()),
                         None => return Err("WebSocket stream closed.".into()),
                     }
+                }
+                _ = shutdown.notified() => {
+                    info!("{} Shutdown signal received. Closing WebSocket connection.", self.log_prefix);
+                    return Ok(());
                 }
             }
         }

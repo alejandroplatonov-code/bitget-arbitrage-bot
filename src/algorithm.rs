@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 /// Запускается в отдельной задаче и периодически проверяет рыночные данные на наличие арбитражных возможностей.
 pub async fn run_trading_algorithm(
     app_state: Arc<AppState>,
-    config: Config,
+    config: Arc<Config>, // <-- ИЗМЕНЕНИЕ: Принимаем Arc<Config>
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
     mut orderbook_update_rx: mpsc::Receiver<String>, // <-- Принимаем Receiver
@@ -36,12 +36,12 @@ pub async fn run_trading_algorithm(
                 tokio::spawn({
                     // Клонируем все необходимое для задачи
                     let app_state = app_state.clone();
-                    let config = config.clone();
+                    let config = config.clone(); // <-- ИЗМЕНЕНИЕ: Клонируем Arc, это дешево
                     let api_client = api_client.clone();
                     let order_watch_tx = order_watch_tx.clone();
 
                     async move {
-                        // --- НОВЫЙ БЛОК: Троттлинг ---
+                        // Троттлинг
                         let throttle_duration = Duration::from_millis(50); // Проверять одну пару не чаще, чем раз в 50 мс
 
                         if let Some(last_check_time) = app_state.inner.last_checked.get(&symbol) {
@@ -51,7 +51,6 @@ pub async fn run_trading_algorithm(
                         }
                         // Если проверки не было или время прошло, обновляем метку
                         app_state.inner.last_checked.insert(symbol.clone(), Instant::now());
-                        // --- КОНЕЦ БЛОКА ---
 
 
                         // ПРОВЕРЯЕМ ТОЛЬКО ОДНУ, ОБНОВИВШУЮСЯ ПАРУ
@@ -66,13 +65,13 @@ pub async fn run_trading_algorithm(
                             handle_open_position(
                                 &symbol,
                                 position,
-                                app_state,
-                                config,
+                                app_state.clone(),
+                                config.clone(), // Клонируем Arc
                                 api_client.clone(),
                                 order_watch_tx.clone(),
                             ).await;
                         } else {
-                            // Просто вызываем обработчик, если позиции нет
+                            // Если позиции нет, проверяем возможность открытия новой
                             if let Some(pair_data) = pair_data_to_handle {
                                 handle_unopened_pair(
                                     &symbol, pair_data, app_state, config, api_client, order_watch_tx,
@@ -97,7 +96,7 @@ async fn handle_open_position(
     symbol: &str,
     position: ActivePosition,
     app_state: Arc<AppState>,
-    config: Config,
+    config: Arc<Config>, // <-- ИЗМЕНЕНИЕ: Принимаем Arc<Config>
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
 ) {
@@ -119,12 +118,12 @@ async fn handle_open_position(
     if let (Some(r_exit_res), Some(c_exit_res)) = (r_exit_opt, c_exit_opt) {
         let revenue_spot_exit = r_exit_res.total_quote_qty;
         let cost_futures_exit = c_exit_res.total_quote_qty;
-
-        // --- УПРОЩЕННАЯ ПРОВЕРКА УСЛОВИЙ ВЫХОДА ---
+ 
+        // --- УПРОЩЕННАЯ ПРОВЕРКА ---
         let close_reason: Option<&'static str> = 
             if app_state.inner.force_close_requests.remove(symbol).is_some() {
                 Some("Force Closed by User")
-            } else if revenue_spot_exit >= cost_futures_exit {
+            } else if revenue_spot_exit >= cost_futures_exit { // Простое условие безубыточности
                 Some("Favorable Exit")
             } else {
                 None
@@ -140,17 +139,37 @@ async fn handle_open_position(
  
                 info!("[{}] LIVE TRADING: Attempting to close position (Reason: {})...", symbol, reason);
  
-                // Генерируем уникальный ID для закрывающих ордеров
-                let client_oid = uuid::Uuid::new_v4().to_string();
- 
+                 // Генерируем уникальный ID для закрывающих ордеров
+                let client_oid = uuid::Uuid::new_v4().to_string(); // Один ID для пары
+
                 // Формируем ордера на закрытие: продаем спот и откупаем фьючерс
-                // Используем `position.base_qty`, который хранит исполненный объем при входе.
-                // Округление здесь не требуется, так как мы продаем то, что уже купили.
+                // --- НАЧАЛО: Логика округления для закрытия ---
+                let rules = app_state.inner.symbol_rules.get(symbol)
+                    .map(|r| *r.value())
+                    .unwrap_or_default();
+
+                // Для market-sell на споте `size` - это объем в базовой валюте.
+                let spot_close_qty = if let Some(scale) = rules.spot_quantity_scale {
+                    trading_logic::round_down(position.base_qty, scale)
+                } else {
+                    warn!("[{}] Spot quantity scale not found for closing. Using unrounded value.", symbol);
+                    position.base_qty
+                };
+
+                // Для market-buy на фьючерсах `size` - это объем в базовой валюте.
+                let futures_close_qty = if let Some(scale) = rules.futures_quantity_scale {
+                    trading_logic::round_down(position.base_qty, scale)
+                } else {
+                    warn!("[{}] Futures quantity scale not found for closing. Using unrounded value.", symbol);
+                    position.base_qty
+                };
+                // --- КОНЕЦ: Логика округления для закрытия ---
+
                 let spot_order_req = PlaceOrderRequest {
                     symbol: position.symbol.clone(),
                     side: "sell".to_string(),
                     order_type: "market".to_string(),
-                    size: position.base_qty.to_string(), // Продаем точный объем, который был куплен
+                    size: spot_close_qty.to_string(), // Используем округленный объем
                     client_oid: Some(client_oid.clone()),
                 };
                 let futures_order_req = PlaceFuturesOrderRequest {
@@ -158,13 +177,13 @@ async fn handle_open_position(
                     product_type: "USDT-FUTURES".to_string(),
                     margin_mode: "isolated".to_string(),
                     margin_coin: "USDT".to_string(),
-                    size: position.base_qty.to_string(), // Откупаем точный объем, который был продан
+                    size: futures_close_qty.to_string(), // Используем округленный объем
                     side: "buy".to_string(),
                     trade_side: None, // Для one_way_mode
                     order_type: "market".to_string(),
                     client_oid: Some(client_oid.clone()),
                 };
- 
+
                 // Запускаем исполнение в отдельной задаче
                 tokio::spawn({
                     let client = api_client.clone();
@@ -184,8 +203,8 @@ async fn handle_open_position(
                                 // Отправляем на отслеживание с контекстом Exit
                                 let spot_watch_req = WatchOrderRequest {
                                     symbol: symbol.clone(),
-                                    order_id: spot_ord.order_id.clone(),
-                                    order_type: OrderType::Spot,
+                                    order_id: spot_ord.order_id.clone(), // Используем один client_oid для сопоставления
+                                    order_type: OrderType::Spot, // Используем один client_oid для сопоставления
                                     client_oid: client_oid.clone(),
                                     context: crate::order_watcher::OrderContext::Exit,
                                 };
@@ -195,7 +214,7 @@ async fn handle_open_position(
                                     order_type: OrderType::Futures,
                                     client_oid: client_oid.clone(),
                                     context: crate::order_watcher::OrderContext::Exit,
-                                };
+                                }; 
  
                                 if order_tx.send(spot_watch_req).await.is_err() {
                                     error!("[{}] Failed to send CLOSE spot order to watcher.", &symbol);
@@ -221,28 +240,20 @@ async fn handle_open_position(
             } else {
                 // *** ВИРТУАЛЬНЫЙ РЕЖИМ ***
                 if let Some((_key, pos_to_close)) = app_state.inner.active_positions.remove(symbol) {
-                    let hundred = Decimal::from(100);
-                    let current_pnl = (pos_to_close.revenue_futures_entry + revenue_spot_exit)
-                        - (pos_to_close.cost_spot_entry + cost_futures_exit);
-                    let exit_spread_percent = if !cost_futures_exit.is_zero() {
-                        ((cost_futures_exit - revenue_spot_exit) / cost_futures_exit) * hundred
-                    } else {
-                        Decimal::ZERO
-                    };
-
+                    // Расчеты PnL и прочего теперь будут в PositionManager или при сохранении
                     let completed_trade = CompletedTrade {
                         entry_data: pos_to_close.clone(),
                         exit_time: Utc::now().timestamp_millis(),
                         cost_exit: cost_futures_exit,
                         revenue_exit: revenue_spot_exit,
-                        final_pnl: current_pnl,
+                        final_pnl: Decimal::ZERO, // Будет рассчитано позже
                         entry_spread_percent: pos_to_close.entry_spread_percent,
-                        exit_spread_percent,
+                        exit_spread_percent: Decimal::ZERO, // Будет рассчитано позже
                     };
                     app_state.inner.completed_trades.entry(symbol.to_string()).or_default().push(completed_trade);
                     info!(
-                        "[{}] CLOSE VIRTUAL POSITION (Reason: {}). Exit Spread: {:.4}%. PnL: {:.4} USDT",
-                        symbol, reason, exit_spread_percent, current_pnl
+                        "[{}] CLOSE VIRTUAL POSITION (Reason: {}).",
+                        symbol, reason
                     );
                 }
             }
@@ -256,7 +267,7 @@ async fn handle_unopened_pair(
     symbol: &str,
     pair_data: PairData,
     app_state: Arc<AppState>,
-    config: Config,
+    config: Arc<Config>,
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
 ) {
@@ -284,15 +295,14 @@ async fn handle_unopened_pair(
     let symbol_owned = symbol.to_string(); // Convert &str to an owned String
     // --- Если все проверки пройдены, запускаем задачу на проверку спреда и исполнение ---
     tokio::spawn(async move {
-        check_and_execute_arbitrage(
-            &symbol_owned,
-            &pair_data,
-            app_state,
-            &config,
-            api_client,
-            &order_watch_tx,
-        )
-        .await;
+         check_and_execute_arbitrage(
+             &symbol_owned,
+             &pair_data,
+             app_state,
+             config, // <-- ПЕРЕДАЕМ Arc ПО ВЛАДЕНИЮ
+             api_client,
+             &order_watch_tx,
+         ).await;
     });
 }
 
@@ -301,16 +311,17 @@ async fn check_and_execute_arbitrage(
     symbol: &str,
     pair_data: &PairData,
     app_state: Arc<AppState>,
-    config: &Config,
+    config: Arc<Config>, // <-- ИЗМЕНЕНИЕ: Принимаем Arc<Config>
     api_client: Arc<ApiClient>,
     order_watch_tx: &mpsc::Sender<WatchOrderRequest>,
 ) {
     let hundred = Decimal::from(100);
 
-    // 1. Берем Last Price и рассчитываем N
-    let last_price = match pair_data.futures_last_price {
-        Some(price) if !price.is_zero() => price,
-        _ => return, // Если цены нет или она нулевая, выходим
+    // 1. Берем лучшую цену из стакана фьючерсов для расчета N.
+    // Это надежнее, чем ждать last_price из канала trades.
+    let last_price = match pair_data.futures_book.asks.iter().next() {
+        Some((&price, _)) if !price.is_zero() => price,
+        _ => return, // Если стакан пуст или цена нулевая, выходим
     };
     let base_qty_n = config.trade_amount_usdt / last_price;
 
@@ -342,15 +353,25 @@ async fn check_and_execute_arbitrage(
                         .map(|r| *r.value())
                         .unwrap_or_default();
 
-                    // Округляем, ТОЛЬКО ЕСЛИ есть правило
-                    let final_base_qty_n = if let Some(scale) = rules.futures_quantity_scale {
+                    // --- НАЧАЛО: Логика округления для входа ---
+                    // Для market-buy на споте `size` - это стоимость в quote (USDT).
+                    let rounded_spot_cost = if let Some(scale) = rules.spot_price_scale {
+                        trading_logic::round_down(cost_spot_entry, scale)
+                    } else {
+                        warn!("[{}] Spot price scale not found. Using unrounded value for entry cost.", symbol);
+                        cost_spot_entry
+                    };
+
+                    // Для market-sell на фьючерсах `size` - это объем в базовой валюте.
+                    let rounded_futures_qty = if let Some(scale) = rules.futures_quantity_scale {
                         trading_logic::round_down(base_qty_n, scale)
                     } else {
                         warn!("[{}] Futures quantity scale not found. Using unrounded value for entry.", symbol);
-                        base_qty_n // Правила нет - отправляем как есть
+                        base_qty_n
                     };
+                    // --- КОНЕЦ: Логика округления для входа ---
 
-                    info!("[{}] ARBITRAGE OPPORTUNITY DETECTED. Gross Spread: {:.4}%. Base Qty (N): {}. Locking pair for execution...", symbol, spread_percent, final_base_qty_n);
+                    info!("[{}] ARBITRAGE OPPORTUNITY DETECTED. Gross Spread: {:.4}%. Base Qty (N): {}. Locking pair for execution...", symbol, spread_percent, rounded_futures_qty);
 
                     if config.live_trading_enabled {
                         // *** БОЕВОЙ РЕЖИМ ***
@@ -358,13 +379,13 @@ async fn check_and_execute_arbitrage(
                             let client = api_client.clone();
                             let symbol = symbol.to_string();
                             let client_oid = client_oid.clone();
-                            let cost_spot_entry_str = cost_spot_entry.to_string();
+                            let rounded_spot_cost_str = rounded_spot_cost.to_string();
                             async move {
                                 let order = PlaceOrderRequest {
                                     symbol: symbol.clone(),
                                     side: "buy".to_string(),
                                     order_type: "market".to_string(),
-                                    size: cost_spot_entry_str, // ИЗМЕНЕНИЕ: Отправляем РАССЧИТАННУЮ стоимость
+                                    size: rounded_spot_cost_str, // ИСПОЛЬЗУЕМ ОКРУГЛЕННОЕ
                                     client_oid: Some(client_oid),
                                 };
                                 client.place_spot_order(order).await
@@ -373,15 +394,15 @@ async fn check_and_execute_arbitrage(
                         let futures_order_task = tokio::spawn({
                             let client = api_client.clone();
                             let symbol = symbol.to_string();
-                            let final_base_qty_n_str = final_base_qty_n.to_string();
+                            let rounded_futures_qty_str = rounded_futures_qty.to_string();
                             let client_oid = client_oid.clone();
                             async move {
                                 let order = PlaceFuturesOrderRequest {
                                     symbol: symbol.clone(),
                                     product_type: "USDT-FUTURES".to_string(),
                                     margin_mode: "isolated".to_string(),
-                                    margin_coin: "USDT".to_string(), // ИСПОЛЬЗУЕМ наше единое N
-                                    size: final_base_qty_n_str,
+                                    margin_coin: "USDT".to_string(),
+                                    size: rounded_futures_qty_str, // ИСПОЛЬЗУЕМ ОКРУГЛЕННОЕ
                                     side: "sell".to_string(),
                                     trade_side: None, // <-- ИЗМЕНЕНИЕ: Не указываем в one-way mode
                                     order_type: "market".to_string(),
@@ -444,7 +465,7 @@ async fn check_and_execute_arbitrage(
                                     product_type: "USDT-FUTURES".to_string(),
                                     margin_mode: "isolated".to_string(),
                                     margin_coin: "USDT".to_string(),
-                                    size: final_base_qty_n.to_string(), // Используем округленный или исходный объем
+                                    size: rounded_futures_qty.to_string(), // Используем округленный объем
                                     side: "buy".to_string(),
                                     trade_side: None, // Для one-way_mode
                                     order_type: "market".to_string(),

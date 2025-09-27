@@ -4,8 +4,8 @@ use crate::orderbook::WsOrderBookData;
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc};
 use std::str::FromStr;
 use tokio::{sync::mpsc, time::{interval, Duration}};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -119,6 +119,20 @@ async fn pair_worker(
                             }
                         }
                     },
+                    "trades" => {
+                        if let Ok(data_vec) = serde_json::from_value::<Vec<WsTradeData>>(data_value) {
+                            if let Some(trade_data) = data_vec.into_iter().next() {
+                                if let Ok(price) = Decimal::from_str(&trade_data.price) {
+                                    let mut pair_data = app_state.market_data.entry(symbol.clone()).or_default();
+                                    if inst_type == "SPOT" {
+                                        pair_data.spot_last_price = Some(price);
+                                    } else {
+                                        pair_data.futures_last_price = Some(price);
+                                    }
+                                }
+                            }
+                        }
+                    },
                     _ => {
                         trace!("{} Received message for unknown channel: {}", log_prefix, msg.arg.channel);
                     },
@@ -134,7 +148,7 @@ async fn pair_worker(
 pub struct BitgetConnector {
     inst_type: String,
     inst_ids: Vec<String>,
-    app_state: Arc<crate::state::AppStateInner>,
+    app_state: std::sync::Arc<crate::state::AppStateInner>,
     channels: Vec<String>, // Changed to Vec<String> to support multiple channels (books, trades)
     orderbook_update_tx: mpsc::Sender<String>,
 }
@@ -143,7 +157,7 @@ impl BitgetConnector {
     pub fn new(
         inst_type: String,
         inst_ids: Vec<String>,        
-        app_state: Arc<crate::state::AppStateInner>,
+        app_state: std::sync::Arc<crate::state::AppStateInner>,
         channels: Vec<String>, // Changed to Vec<String>
         orderbook_update_tx: mpsc::Sender<String>,
     ) -> Self {
@@ -151,7 +165,7 @@ impl BitgetConnector {
     }
 
     /// Управляет запуском нескольких соединений.
-    pub async fn run(self, shutdown: Arc<tokio::sync::Notify>) { // self is consumed here
+    pub async fn run(self, shutdown: std::sync::Arc<tokio::sync::Notify>) { // self is consumed here
         info!("[{}] Main connector manager starting for {} pairs.", self.inst_type, self.inst_ids.len());
 
         // Устанавливаем, сколько пар будет на одно WebSocket соединение.
@@ -194,14 +208,14 @@ struct SubConnector {
     log_prefix: String,
     inst_type: String,
     inst_ids: Vec<String>,
-    app_state: Arc<crate::state::AppStateInner>,
+    app_state: std::sync::Arc<crate::state::AppStateInner>,
     channels: Vec<String>, // Changed to Vec<String>
     orderbook_update_tx: mpsc::Sender<String>,
 }
 
 impl SubConnector {
     /// Управляет циклом переподключений для одного соединения.
-    async fn run_connection_loop(&self, shutdown: Arc<tokio::sync::Notify>) {
+    async fn run_connection_loop(&self, shutdown: std::sync::Arc<tokio::sync::Notify>) {
         loop {
             info!("{} Attempting to connect for {} pairs...", self.log_prefix, self.inst_ids.len());
 
@@ -217,13 +231,13 @@ impl SubConnector {
 
     /// Выполняет работу в рамках одного WebSocket соединения.
     /// Этот код - это ваш предыдущий `connect_and_process` почти без изменений.
-    async fn connect_and_process(&self, shutdown: Arc<tokio::sync::Notify>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_and_process(&self, shutdown: std::sync::Arc<tokio::sync::Notify>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (ws_stream, _) = connect_async(BITGET_WS_URL).await?;
         info!("{} WebSocket connection successful.", self.log_prefix);
         let (mut writer, mut reader) = ws_stream.split();
 
         // Запуск worker'ов для пар ЭТОГО соединения
-        let worker_channels = Arc::new(DashMap::<String, mpsc::Sender<String>>::new());
+        let worker_channels = std::sync::Arc::new(DashMap::<String, mpsc::Sender<String>>::new());
         for symbol in &self.inst_ids {
             let (worker_tx, worker_rx) = mpsc::channel(128);
             worker_channels.insert(symbol.clone(), worker_tx);
