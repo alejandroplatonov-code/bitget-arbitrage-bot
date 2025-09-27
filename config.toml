@@ -2,7 +2,7 @@
 trade_amount_usdt = 8
 
 # Минимальный чистый процентный спред для входа в сделку
-spread_threshold_percent = 0.5
+spread_threshold_percent = 1
 
 # Комиссия тейкера на бирже в процентах
 taker_fee_percent = 0.0
@@ -23,7 +23,7 @@ ui_update_ms = 1000
 live_trading_enabled = true
 
 # Максимальное количество одновременно открытых позиций
-max_active_positions = 1
+max_active_positions = 2
 
 # Задержка в миллисекундах между проверками одной и той же пары (троттлинг)
 throttle_ms = 50

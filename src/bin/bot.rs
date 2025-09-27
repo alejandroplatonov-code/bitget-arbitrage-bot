@@ -389,10 +389,11 @@ async fn command_listener_task(
             Some(command) = command_rx.recv() => {
                 match command.action.as_str() {
                     "graceful_stop" => {
-                        info!("[CommandListener] Received 'graceful_stop' command. Setting status to Stopping.");
+                        info!("[CommandListener] Received 'graceful_stop' command. Setting status to 'Stopping'. The bot will shut down after closing all positions.");
                         app_state.inner.trading_status.store(TradingStatus::Stopping as u8, Ordering::SeqCst);
-                        shutdown.notify_waiters();
-                        shutdown_signal_task.abort(); // Отменяем задачу Ctrl+C, чтобы она не блокировала выход
+                        // НЕ вызываем shutdown.notify_waiters()!
+                        // Просто переводим бота в режим "только закрытие".
+                        // Алгоритм сам инициирует остановку, когда закроет все позиции.
                     },
                     "force_close" => {
                         if let Some(symbol) = command.symbol {

@@ -72,6 +72,15 @@ pub async fn run_trading_algorithm(
                 break; // Выходим из `loop`
             }
         }
+
+        // --- ПРОВЕРКА НА GRACEFUL STOP ---
+        // Если установлен статус "Остановка" и все позиции закрыты, инициируем полное завершение.
+        let status = app_state.inner.trading_status.load(Ordering::SeqCst);
+        if status == TradingStatus::Stopping as u8 && app_state.inner.active_positions.is_empty() {
+            info!("[Algorithm] Graceful stop complete: all positions are closed. Shutting down.");
+            shutdown.notify_waiters();
+            break; // Выходим из цикла алгоритма
+        }
     }
 }
 
