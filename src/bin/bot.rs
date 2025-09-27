@@ -261,23 +261,12 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     for spot_info in spot_symbols {
         let mut rules = app_state.inner.symbol_rules.entry(spot_info.symbol.clone()).or_default();
         
-        // --- ИЗМЕНЕНИЕ: Логика с фолбэком для quantityScale и priceScale ---
+        // Оставляем только quantityScale для спота, так как он нужен для закрытия
         match spot_info.quantity_scale.and_then(|s| s.parse::<u32>().ok()) {
             Some(s) => rules.spot_quantity_scale = Some(s),
             None => {
                 warn!("[RulesLoader] Spot symbol {} is missing 'quantityScale'. Using fallback scale of 6.", spot_info.symbol);
                 rules.spot_quantity_scale = Some(6);
-            }
-        }
-
-        match spot_info.price_scale.and_then(|s| s.parse::<u32>().ok()) {
-            Some(s) => rules.spot_price_scale = Some(s),
-            None => {
-                // Для USDT-пар цена - это USDT. Обычно у него 2-4 знака.
-                // Ошибка 40808 упоминает 8 знаков, что странно, но безопасно использовать как фолбэк.
-                // Это предотвратит ошибки, если API не вернет `priceScale`.
-                warn!("[RulesLoader] Spot symbol {} is missing 'priceScale'. Using fallback scale of 8.", spot_info.symbol);
-                rules.spot_price_scale = Some(8);
             }
         }
     }
@@ -290,25 +279,13 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     }
     let futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
 
-    for fut_info in futures_symbols {
-        let mut rules = app_state.inner.symbol_rules.entry(fut_info.symbol).or_default();
-        // Парсим множитель, и если он валидный, вычисляем и сохраняем его scale.
-        if let Ok(multiplier) = rust_decimal::Decimal::from_str(&fut_info.size_multiplier) {
-            // scale() возвращает u32, что соответствует нашему новому типу поля
-            rules.futures_quantity_scale = Some(multiplier.scale());
-        }
-    }
+    // Логика для futures_quantity_scale полностью удалена, так как мы используем глобальную константу.
 
     // --- Verification (Optional but recommended) ---
     let trading_pairs = load_token_list()?;
     let mut missing_rules_count = 0;
     for pair in trading_pairs {
-        if let Some(rules) = app_state.inner.symbol_rules.get(&pair) {
-            if rules.spot_quantity_scale.is_none() || rules.futures_quantity_scale.is_none() || rules.spot_price_scale.is_none() {
-                warn!("[RulesLoader] Incomplete rules for {}: {:?}", pair, rules.value());
-                missing_rules_count += 1;
-            }
-        } else {
+        if !app_state.inner.symbol_rules.contains_key(&pair) {
             warn!("[RulesLoader] No rules found for trading pair: {}", pair);
             missing_rules_count += 1;
         }

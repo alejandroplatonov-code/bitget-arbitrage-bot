@@ -130,25 +130,13 @@ async fn handle_open_position(
 
                 // Формируем ордера на закрытие: продаем спот и откупаем фьючерс
                 // --- НАЧАЛО: Логика округления для закрытия ---
-                let rules = app_state.inner.symbol_rules.get(symbol)
-                    .map(|r| *r.value())
-                    .unwrap_or_default();
+                const GLOBAL_QUANTITY_SCALE: u32 = 4; // Глобальное правило: 4 знака
 
                 // Для market-sell на споте `size` - это объем в базовой валюте.
-                let spot_close_qty = if let Some(scale) = rules.spot_quantity_scale {
-                    trading_logic::round_down(position.base_qty, scale)
-                } else {
-                    warn!("[{}] Spot quantity scale not found for closing. Using unrounded value.", symbol);
-                    position.base_qty
-                };
+                let spot_close_qty = position.base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
 
                 // Для market-buy на фьючерсах `size` - это объем в базовой валюте.
-                let futures_close_qty = if let Some(scale) = rules.futures_quantity_scale {
-                    trading_logic::round_down(position.base_qty, scale)
-                } else {
-                    warn!("[{}] Futures quantity scale not found for closing. Using unrounded value.", symbol);
-                    position.base_qty
-                };
+                let futures_close_qty = position.base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
                 // --- КОНЕЦ: Логика округления для закрытия ---
 
                 let spot_order_req = PlaceOrderRequest {
@@ -334,32 +322,13 @@ fn check_and_execute_arbitrage( // No longer async
                     // Генерируем уникальный ID для этой пары ордеров
                     let client_oid = uuid::Uuid::new_v4().to_string();
 
-                    // Получаем правила для символа. Если их нет, используем `default()`.
-                    let rules = app_state.inner.symbol_rules.get(symbol)
-                        .map(|r| *r.value())
-                        .unwrap_or_default();
-
-                    // --- НАЧАЛО: Логика округления для входа ---
-                    // Увеличиваем стоимость на процент "подушки безопасности"
-                    let cost_with_slippage = cost_spot_entry * (Decimal::ONE + config.spot_slippage_buffer_percent / Decimal::from(100));
-
-                    // Для market-buy на споте `size` - это стоимость в quote (USDT).
-                    let rounded_spot_cost = if let Some(scale) = rules.spot_price_scale {
-                        // Округляем ВВЕРХ (Ceiling), чтобы гарантированно покрыть стоимость с проскальзыванием.
-                        cost_with_slippage.round_dp_with_strategy(scale, RoundingStrategy::AwayFromZero)
-                    } else {
-                        warn!("[{}] Spot price scale not found. Using unrounded value for entry cost.", symbol);
-                        cost_with_slippage
-                    };
+                    // --- НОВАЯ ГЛОБАЛЬНАЯ ЛОГИКА ОКРУГЛЕНИЯ ДЛЯ ФЬЮЧЕРСА ---
+                    const GLOBAL_QUANTITY_SCALE: u32 = 4; // Глобальное правило: 4 знака
 
                     // Для market-sell на фьючерсах `size` - это объем в базовой валюте.
-                    let rounded_futures_qty = if let Some(scale) = rules.futures_quantity_scale {
-                        trading_logic::round_down(base_qty_n, scale)
-                    } else {
-                        warn!("[{}] Futures quantity scale not found. Using unrounded value for entry.", symbol);
-                        base_qty_n
-                    };
-                    // --- КОНЕЦ: Логика округления для входа ---
+                    // Жестко "отрезаем" все, что идет после 4-го знака.
+                    let rounded_futures_qty = base_qty_n.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
                     info!("[{}] ARBITRAGE OPPORTUNITY DETECTED. Gross Spread: {:.4}%. Base Qty (N): {}. Locking pair for execution...", symbol, spread_percent, rounded_futures_qty);
 
@@ -367,7 +336,7 @@ fn check_and_execute_arbitrage( // No longer async
                         // --- KEY CHANGE: "Fire and forget" ---
                         tokio::spawn(execute_trade_task(
                             symbol.to_string(),
-                            rounded_spot_cost, rounded_futures_qty, client_oid, app_state, api_client, order_watch_tx, compensation_tx, shutdown
+                            cost_spot_entry, rounded_futures_qty, client_oid, app_state, config, api_client, order_watch_tx, compensation_tx, shutdown
                         ));
                     } // In virtual mode, we do nothing and the lock will expire or be handled elsewhere.
                 }
@@ -379,15 +348,25 @@ fn check_and_execute_arbitrage( // No longer async
 // --- НОВАЯ ФУНКЦИЯ: execute_trade_task ---
 async fn execute_trade_task( // This new function runs in the background
     symbol: String,
-    rounded_spot_cost: Decimal,
+    cost_spot_entry: Decimal,
     rounded_futures_qty: Decimal,
     client_oid: String,
     app_state: Arc<AppState>,
+    config: Arc<Config>,
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
     compensation_tx: mpsc::Sender<CompensationTask>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
+    // --- НОВАЯ ГЛОБАЛЬНАЯ ЛОГИКА ОКРУГЛЕНИЯ ДЛЯ СПОТА ---
+    let cost_with_slippage = cost_spot_entry * (Decimal::ONE + config.spot_slippage_buffer_percent / Decimal::from(100));
+
+    const GLOBAL_PRICE_SCALE: u32 = 4; // Глобальное правило: 4 знака
+
+    // Жестко "отрезаем" все, что идет после 4-го знака.
+    let rounded_spot_cost = cost_with_slippage.trunc_with_scale(GLOBAL_PRICE_SCALE);
+    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
     // 1. Отправляем ордера параллельно
     let (spot_res, fut_res) = tokio::join!(
         async {

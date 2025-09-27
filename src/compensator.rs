@@ -68,18 +68,18 @@ async fn handle_compensation_task(
         attempts += 1;
         warn!("[Compensator] Attempt #{} to compensate leg for {} (original order ID: {})", attempts, task.symbol, task.original_order_id);
 
-        let rules = app_state.inner.symbol_rules.get(&task.symbol).map(|r| *r.value()).unwrap_or_default();
+        const GLOBAL_QUANTITY_SCALE: u32 = 4;
 
         let result: Result<_, _> = match (task.leg_to_compensate, task.original_direction) {
             // Original was BuySpot, so we need to SellSpot.
             (OrderType::Spot, ArbitrageDirection::BuySpotSellFutures) => {
-                let qty = trading_logic::round_down(task.base_qty_to_compensate, rules.spot_quantity_scale.unwrap_or(6));
+                let qty = task.base_qty_to_compensate.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
                 let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: "sell".to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
                 api_client.place_spot_order(req).await.map(|_| ())
             },
             // Original was SellFutures, so we need to BuyFutures.
             (OrderType::Futures, ArbitrageDirection::BuySpotSellFutures) => {
-                let qty = trading_logic::round_down(task.base_qty_to_compensate, rules.futures_quantity_scale.unwrap_or(4));
+                let qty = task.base_qty_to_compensate.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
                 let req = PlaceFuturesOrderRequest { symbol: task.symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(), margin_coin: "USDT".to_string(), size: qty.to_string(), side: "buy".to_string(), trade_side: None, order_type: "market".to_string(), client_oid: None };
                 api_client.place_futures_order(req).await.map(|_| ())
             },

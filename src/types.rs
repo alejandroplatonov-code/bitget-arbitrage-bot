@@ -9,8 +9,6 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SymbolRules {
     pub spot_quantity_scale: Option<u32>,
-    pub spot_price_scale: Option<u32>,
-    pub futures_quantity_scale: Option<u32>,
 }
 
 /// Represents the synchronization state of an order book for a single instrument.
