@@ -2,7 +2,6 @@
 
 use crate::api_client::{ApiClient, PlaceFuturesOrderRequest, PlaceOrderRequest};
 use crate::state::AppState;
-use crate::trading_logic;
 use crate::types::{ArbitrageDirection, CompensationTask};
 use crate::order_watcher::OrderType;
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use tracing::{error, info, warn};
 pub async fn run_compensator(
     mut task_rx: mpsc::Receiver<CompensationTask>,
     api_client: Arc<ApiClient>,
-    app_state: Arc<AppState>,
+    _app_state: Arc<AppState>, // Not used, but kept for signature consistency
     shutdown: Arc<Notify>,
 ) {
     info!("[Compensator] Service started. Waiting for compensation tasks...");
@@ -33,9 +32,8 @@ pub async fn run_compensator(
                 // --- ИЗМЕНЕНИЕ 2: Запускаем задачу внутри управляемого JoinSet ---
                 compensation_tasks.spawn({
                     let client = api_client.clone();
-                    let state = app_state.clone();
                     async move {
-                        handle_compensation_task(task, client, state).await;
+                        handle_compensation_task(task, client).await;
                     }
                 });
             },
@@ -61,7 +59,6 @@ pub async fn run_compensator(
 async fn handle_compensation_task(
     task: CompensationTask,
     api_client: Arc<ApiClient>,
-    app_state: Arc<AppState>,
 ) {
     let mut attempts = 0;
     loop {

@@ -3,18 +3,17 @@
 use crate::api_client::{ApiClient, PlaceFuturesOrderRequest, PlaceOrderRequest};
 use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
+use crate::utils::send_cancellable;
 use crate::state::AppState;
 use crate::trading_logic::{self, round_down};
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, CompensationTask, PairData, TradingStatus};
-use crate::utils::send_cancellable;
 use chrono::Utc;
-use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use std::sync::atomic::{Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Runs the main trading algorithm loop. This is the "hot path".
 /// It synchronously processes market data updates to minimize latency.
@@ -76,6 +75,9 @@ pub async fn run_trading_algorithm(
     }
 }
 
+// Можно вынести в конфиг, но для начала достаточно константы
+const POSITION_COOLDOWN: Duration = Duration::from_secs(2); 
+
 /// Обрабатывает одну открытую позицию: обновляет ее состояние и проверяет условия выхода.
 async fn handle_open_position(
     symbol: &str,
@@ -86,6 +88,14 @@ async fn handle_open_position(
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
+    // --- ДОБАВЬТЕ ЭТУ ПРОВЕРКУ В САМОМ НАЧАЛЕ ФУНКЦИИ ---
+    if position.created_at.elapsed() < POSITION_COOLDOWN {
+        // Позиция "слишком свежая". Игнорируем этот тик, чтобы дать бирже время
+        // на обработку баланса.
+        return;
+    }
+    // --- КОНЕЦ ПРОВЕРКИ ---
+
     // Для проверки выхода нам нужны актуальные рыночные данные
     let pair_data = match app_state.inner.market_data.get(symbol) {
         Some(data) => data,

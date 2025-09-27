@@ -90,6 +90,15 @@ pub struct ActivePosition {
 
     // НОВОЕ ПОЛЕ
     pub entry_spread_percent: Decimal,
+
+    // Временная метка создания позиции для "периода охлаждения"
+    #[serde(skip, default = "default_instant")]
+    pub created_at: Instant,
+}
+
+/// Helper function to provide a default value for the skipped `Instant` field.
+fn default_instant() -> Instant {
+    Instant::now()
 }
 
 /// Represents a trade that has been closed.

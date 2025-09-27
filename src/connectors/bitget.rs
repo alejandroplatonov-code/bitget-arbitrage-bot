@@ -1,11 +1,9 @@
 // src/connectors/bitget.rs
 
 use crate::orderbook::WsOrderBookData;
-use futures_util::{SinkExt, StreamExt};
 use dashmap::DashMap;
-use rust_decimal::Decimal;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use tokio::{sync::mpsc, time::{interval, Duration}};
 use tokio::task::JoinSet;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
