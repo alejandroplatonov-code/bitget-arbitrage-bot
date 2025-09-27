@@ -11,7 +11,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use std::sync::atomic::{Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant}; // No change needed here, but for context
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -50,13 +50,14 @@ pub async fn run_trading_algorithm(
                 let api_client_clone = api_client.clone();
                 let order_watch_tx_clone = order_watch_tx.clone();
                 let compensation_tx_clone = compensation_tx.clone();
+
                 let shutdown_clone = shutdown.clone();
 
                 // Check if there's an open position for the symbol.
                 if let Some(position) = app_state.inner.active_positions.get(&symbol).map(|p| p.value().clone()) {
                     // If yes, spawn a task to handle the closing logic (less time-critical).
                     tokio::spawn(async move {
-                        handle_open_position(&symbol, position, app_state_clone, config_clone, api_client_clone, order_watch_tx_clone, shutdown_clone).await;
+                        handle_open_position(&symbol, position, app_state_clone, config_clone, api_client_clone, order_watch_tx_clone, compensation_tx_clone, shutdown_clone).await;
                     });
                 } else {
                     // If no position, check for a new opening opportunity. This is the most critical path.
@@ -95,6 +96,7 @@ async fn handle_open_position(
     config: Arc<Config>, // <-- ИЗМЕНЕНИЕ: Принимаем Arc<Config>
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
+    compensation_tx: mpsc::Sender<CompensationTask>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     // --- ДОБАВЬТЕ ЭТУ ПРОВЕРКУ В САМОМ НАЧАЛЕ ФУНКЦИИ ---
@@ -183,6 +185,8 @@ async fn handle_open_position(
                     let client = api_client.clone();
                     let order_tx = order_watch_tx.clone();
                     let symbol = symbol.to_string();
+                    let compensation_tx = compensation_tx.clone();
+                    let position = position.clone();
                     let app_state = app_state.clone();
                     let shutdown = shutdown.clone();
  
@@ -193,13 +197,13 @@ async fn handle_open_position(
                         );
  
                         match (&spot_res, &fut_res) {
-                            (Ok(spot_ord), Ok(fut_ord)) => {
+                            (Ok(spot_ord), Ok(fut_ord)) => { // --- СЦЕНАРИЙ 1: ПОЛНЫЙ УСПЕХ ---
                                 info!("[{}] Successfully sent CLOSE orders.", &symbol);
                                 // Отправляем на отслеживание с контекстом Exit
                                 let spot_watch_req = WatchOrderRequest {
                                     symbol: symbol.clone(),
-                                    order_id: spot_ord.order_id.clone(), // Используем один client_oid для сопоставления
-                                    order_type: OrderType::Spot, // Используем один client_oid для сопоставления
+                                    order_id: spot_ord.order_id.clone(),
+                                    order_type: OrderType::Spot,
                                     client_oid: client_oid.clone(),
                                     context: crate::order_watcher::OrderContext::Exit,
                                 };
@@ -208,25 +212,37 @@ async fn handle_open_position(
                                     order_id: fut_ord.order_id.clone(),
                                     order_type: OrderType::Futures,
                                     client_oid: client_oid.clone(),
-                                    context: crate::order_watcher::OrderContext::Exit,
+                                    context: crate::order_watcher::OrderContext::Exit
                                 }; 
  
                                 if !send_cancellable(&order_tx, spot_watch_req, &shutdown).await {
                                     error!("[{}] Failed to send CLOSE spot order to watcher.", &symbol);
-                                    // TODO: Критическая ошибка, нужна логика компенсации
-                                    app_state.inner.executing_pairs.remove(&symbol);
                                 }
                                 if !send_cancellable(&order_tx, fut_watch_req, &shutdown).await {
                                     error!("[{}] Failed to send CLOSE futures order to watcher.", &symbol);
-                                    // TODO: Критическая ошибка, нужна логика компенсации
-                                    app_state.inner.executing_pairs.remove(&symbol);
                                 }
-                                // `PositionManager` обработает исполнение, удалит `ActivePosition`
-                                // и снимет блокировку `executing_pairs`.
                             },
-                            _ => {
-                                error!("[{}] FAILED to send one or both CLOSE orders. Will retry. Spot: {:?}, Futures: {:?}", &symbol, spot_res, fut_res);
-                                // Снимаем блокировку, чтобы можно было попробовать снова
+                            // --- СЦЕНАРИЙ 2: СПОТ ОШИБКА, ФЬЮЧЕРС УСПЕХ ---
+                            (Err(e_spot), Ok(fut_ord)) => {
+                                error!("!!! CLOSE FAILED (SPOT): {:?} !!!", e_spot);
+                                error!("[{}] LEGGING RISK ON CLOSE: Placed FUTURES order {} but FAILED to place SPOT order. Delegating to compensator.", symbol, &fut_ord.order_id);
+                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id.clone(), base_qty_to_compensate: position.base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
+                                if !send_cancellable(&compensation_tx, task, &shutdown).await {
+                                    error!("[{}] CRITICAL: Failed to send CLOSE compensation task for SPOT leg!", symbol);
+                                }
+                            },
+                            // --- СЦЕНАРИЙ 3: СПОТ УСПЕХ, ФЬЮЧЕРС ОШИБКА ---
+                            (Ok(spot_ord), Err(e_fut)) => {
+                                error!("!!! CLOSE FAILED (FUTURES): {:?} !!!", e_fut);
+                                error!("[{}] LEGGING RISK ON CLOSE: Placed SPOT order {} but FAILED to place FUTURES order. Delegating to compensator.", symbol, &spot_ord.order_id);
+                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id.clone(), base_qty_to_compensate: position.base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
+                                if !send_cancellable(&compensation_tx, task, &shutdown).await {
+                                    error!("[{}] CRITICAL: Failed to send CLOSE compensation task for FUTURES leg!", symbol);
+                                }
+                            },
+                            // --- СЦЕНАРИЙ 4: ОБЕ ОШИБКИ ---
+                            (Err(e_spot), Err(e_fut)) => {
+                                error!("[{}] FAILED to send both CLOSE orders. Spot: {:?}, Futures: {:?}. Releasing lock to retry.", &symbol, e_spot, e_fut);
                                 app_state.inner.executing_pairs.remove(&symbol);
                             }
                         }

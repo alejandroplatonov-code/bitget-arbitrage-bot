@@ -1,6 +1,7 @@
 // src/connectors/bitget.rs
 
 use crate::orderbook::WsOrderBookData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -45,12 +46,11 @@ async fn pair_worker(
     app_state: std::sync::Arc<crate::state::AppStateInner>,
     orderbook_update_tx: mpsc::Sender<String>,
     mut rx: mpsc::Receiver<String>,
+    synced_counter: std::sync::Arc<AtomicUsize>,
     shutdown: std::sync::Arc<tokio::sync::Notify>, // <-- Добавляем shutdown
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let log_prefix = format!("[{}/{}]", inst_type, symbol);
     let mut is_synced = false;
-
-    info!("{} Worker started.", log_prefix);
 
     loop {
         tokio::select! {
@@ -73,7 +73,8 @@ async fn pair_worker(
                                             Some("snapshot") => {
                                                 book.apply_snapshot(&data);
                                                 is_synced = true;
-                                                info!("{} Synced from snapshot.", log_prefix);
+                                        // Увеличиваем счетчик вместо логирования
+                                        synced_counter.fetch_add(1, Ordering::Relaxed);
                                                 if orderbook_update_tx.try_send(symbol.clone()).is_err() {
                                                     // Канал переполнен, ничего страшного
                                                 }
@@ -253,11 +254,29 @@ impl SubConnector {
         let (ws_stream, _) = connect_async(BITGET_WS_URL).await?;
         info!("{} WebSocket connection successful.", self.log_prefix);
         let (mut writer, mut reader) = ws_stream.split();
+
+        // --- НОВЫЙ БЛОК: Групповое логирование синхронизации ---
+        let synced_counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let total_pairs = self.inst_ids.len();
+        let log_prefix_clone = self.log_prefix.clone();
+        let synced_counter_clone = synced_counter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let count = synced_counter_clone.load(Ordering::Relaxed);
+                if count >= total_pairs {
+                    info!("{} All {} pairs synced from snapshots.", log_prefix_clone, total_pairs);
+                    break; // Завершаем задачу после вывода лога
+                }
+            }
+        });
     
         // --- ИЗМЕНЕНИЕ 1: Используем JoinSet для управления воркерами ---
         let mut worker_tasks = JoinSet::new();
         let worker_channels = std::sync::Arc::new(DashMap::<String, mpsc::Sender<String>>::new());
     
+
         for symbol in &self.inst_ids {
             let (worker_tx, worker_rx) = mpsc::channel(128);
             worker_channels.insert(symbol.clone(), worker_tx);
@@ -269,9 +288,11 @@ impl SubConnector {
                 self.app_state.clone(),
                 self.orderbook_update_tx.clone(),
                 worker_rx,
+                synced_counter.clone(), // Передаем счетчик в воркер
                 shutdown.clone(), // Передаем shutdown в воркер
             ));
         }
+        info!("{} Started {} pair workers.", self.log_prefix, self.inst_ids.len());
         
         // Код подписки остается без изменений
         let mut args: Vec<SubscribeArg> = Vec::new();

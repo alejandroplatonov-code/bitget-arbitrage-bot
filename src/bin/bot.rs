@@ -258,6 +258,7 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     }
     let spot_symbols: Vec<SpotSymbolInfo> = serde_json::from_value(spot_rules_data["data"].clone())?;
 
+    let mut missing_scale_symbols = Vec::new();
     for spot_info in spot_symbols {
         let mut rules = app_state.inner.symbol_rules.entry(spot_info.symbol.clone()).or_default();
         
@@ -265,10 +266,13 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
         match spot_info.quantity_scale.and_then(|s| s.parse::<u32>().ok()) {
             Some(s) => rules.spot_quantity_scale = Some(s),
             None => {
-                warn!("[RulesLoader] Spot symbol {} is missing 'quantityScale'. Using fallback scale of 6.", spot_info.symbol);
+                missing_scale_symbols.push(spot_info.symbol);
                 rules.spot_quantity_scale = Some(6);
             }
         }
+    }
+    if !missing_scale_symbols.is_empty() {
+        warn!("[RulesLoader] {} spot symbols are missing 'quantityScale' and will use a fallback scale of 6. Examples: {:?}", missing_scale_symbols.len(), &missing_scale_symbols[..5.min(missing_scale_symbols.len())]);
     }
 
     // --- Fetch Futures Rules ---
