@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SPOT".to_string(),
         pairs.clone(),
         app_state.inner.clone(),
-        vec!["books".to_string(), "trades".to_string()], // Subscribe to both books and trades
+        vec!["books".to_string()], // Subscribe only to books
         dummy_tx.clone(),
     );
     tokio::spawn(async move { spot_connector.run(Arc::new(tokio::sync::Notify::new())).await });
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "USDT-FUTURES".to_string(),
         pairs,
         app_state.inner.clone(),
-        vec!["books".to_string(), "trades".to_string()], // Subscribe to both books and trades
+        vec!["books".to_string()], // Subscribe only to books
         dummy_tx,
     );
     tokio::spawn(async move { futures_connector.run(Arc::new(tokio::sync::Notify::new())).await });

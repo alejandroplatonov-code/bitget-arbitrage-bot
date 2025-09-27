@@ -2,6 +2,7 @@
 
 pub mod algorithm;
 pub mod api_client; // Already public
+pub mod compensator;
 pub mod config;
 pub mod connectors;
 pub mod error;
@@ -11,6 +12,7 @@ pub mod position_manager;
 pub mod state;
 pub mod trading_logic;
 pub mod types;
+pub mod utils;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};

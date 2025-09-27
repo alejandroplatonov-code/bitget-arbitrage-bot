@@ -44,7 +44,7 @@ pub async fn run_position_manager(
             }
         }
     }
-    warn!("[PositionManager] MPSC channel closed. Shutting down.");
+    warn!("[PositionManager] MPSC channel closed or shutdown signal received. Service is shutting down.");
 }
 
 /// Обрабатывает исполнение ОДНОГО ордера на ВХОД.

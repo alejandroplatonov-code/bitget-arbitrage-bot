@@ -3,6 +3,7 @@ use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method, RequestBuilder};
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 // CONSTANTS
@@ -18,6 +19,7 @@ pub struct PlaceOrderRequest {
     pub symbol: String,
     pub side: String, // "buy" or "sell"
     pub order_type: String, // "market" for our use case
+    pub force: String,
     pub size: String, // Quantity in quote currency for market buy, in base currency for market sell
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,7 +125,10 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(api_key: String, secret_key: String, passphrase: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10)) // Общий таймаут на весь запрос
+                .build()
+                .expect("Failed to build reqwest client"),
             api_key,
             secret_key,
             passphrase,

@@ -20,6 +20,11 @@ pub struct Config {
     pub taker_fee_percent: Decimal,
     pub log_level: String,
     pub ui_update_ms: u64,
+    // Процент, который будет добавлен к расчетной стоимости спотового ордера
+    // для покрытия проскальзывания. 0.5 означает 0.5%.
+    pub spot_slippage_buffer_percent: Decimal,
+    pub throttle_ms: u64,
+    pub redis_url: String,
     pub live_trading_enabled: bool,
 
     // НОВОЕ ПОЛЕ

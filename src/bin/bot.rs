@@ -3,6 +3,7 @@
 use rust_template_for_testing::{
     algorithm::run_trading_algorithm,
     api_client::ApiClient,
+    compensator::run_compensator,
     config::Config,
     config::load_token_list,
     connectors::bitget::BitgetConnector,
@@ -12,6 +13,7 @@ use rust_template_for_testing::{
     state::AppState, // SymbolRules is fetched but only used inside algorithm.rs
     types::{TradingStatus, WsCommand},
 };
+use rust_template_for_testing::utils::send_cancellable;
 use std::{time::Duration, str::FromStr};
 use futures_util::future::FutureExt;
 use futures_util::StreamExt;
@@ -64,7 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (order_watch_tx, order_watch_rx) = mpsc::channel(256);
     let (order_filled_tx, order_filled_rx) = mpsc::channel(256);
     let (bot_command_tx, bot_command_rx) = mpsc::channel(32);
-    let redis_client = redis::Client::open("redis://127.0.0.1/")?; // Client is clonable
+    let (compensation_tx, compensation_rx) = mpsc::channel(64);
+    let redis_client = redis::Client::open(config.redis_url.as_str())?; // Client is clonable
     let _redis_publisher = redis_client.get_multiplexed_tokio_connection().await?; // Keep for potential future use, but not for PM/Watcher
     info!("[Bot] Redis client initialized.");
 
@@ -99,19 +102,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "SPOT".to_string(),
         trading_pairs.clone(),
         app_state.inner.clone(),
-        vec!["books".to_string(), "trades".to_string()], // <-- Добавлен "trades"
+        vec!["books".to_string()], // Оставляем только books
         orderbook_update_tx.clone(),
     );
 
-    // --- И ИЗМЕНЕНИЕ ЗДЕСЬ ---
     let futures_connector = BitgetConnector::new(
         "USDT-FUTURES".to_string(),
         trading_pairs,
         app_state.inner.clone(),
-        vec!["books".to_string(), "trades".to_string()], // <-- Добавлен "trades"
+        vec!["books".to_string()], // Оставляем только books
         orderbook_update_tx,
     );
-    // --- КОНЕЦ ИЗМЕНЕНИЙ ---
 
     // --- НОВЫЙ БЛОК: Механизм Graceful Shutdown ---
     let shutdown_notify = Arc::new(Notify::new());
@@ -148,11 +149,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
     info!("[Bot] Position Manager started.");
 
+    // --- NEW: Запуск компенсатора ---
+    let compensator_handle = tokio::spawn(run_compensator(
+        compensation_rx,
+        api_client.clone(),
+        app_state.clone(),
+        shutdown_notify.clone(),
+    ));
+    info!("[Bot] Compensator started.");
+
     // --- 9. ЗАПУСК СЛУШАТЕЛЯ КОМАНД ---
     let cmd_listener_handle = tokio::spawn(command_listener_task( // Now receives from mpsc
         app_state.clone(),
         bot_command_rx, // <-- ПРИНИМАЕТ ИЗ MPSC
-        shutdown_notify.clone()
+        shutdown_notify.clone(),
+        shutdown_signal_task.into() // Передаем JoinHandle в задачу
     ));
     info!("[Bot] Command Listener started.");
 
@@ -171,26 +182,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.clone(), // <-- ИЗМЕНЕНИЕ: Просто клонируем Arc
         api_client.clone(),
         order_watch_tx,
+        compensation_tx,
         orderbook_update_rx, shutdown_notify.clone()
     ));
     info!("[Bot] Trading Algorithm started.");
 
-    // --- 10. Ожидание завершения любой из задач ---
+    // --- 10. ОЖИДАНИЕ ЗАВЕРШЕНИЯ И КОРРЕКТНАЯ ОСТАНОВКА ---
+    // `&mut` используется, чтобы `select!` не забирал владение над JoinHandle'ами.
+    // let mut shutdown_signal_task = shutdown_signal_task; // Больше не нужна здесь, т.к. передана в listener
+    let mut spot_handle = spot_handle;
+    let mut futures_handle = futures_handle;
+    let mut algorithm_handle = algorithm_handle;
+    let mut order_watcher_handle = order_watcher_handle;
+    let mut position_manager_handle = position_manager_handle;
+    let mut cmd_listener_handle = cmd_listener_handle;
+    let mut compensator_handle = compensator_handle;
+    let mut redis_dispatcher_handle = redis_dispatcher_handle;
+
     tokio::select! {
-        _ = shutdown_signal_task => { /* Ctrl+C был нажат, просто ждем завершения других задач */ },
-        _ = spot_handle => warn!("[Bot] Spot connector task finished unexpectedly."),
-        _ = futures_handle => warn!("[Bot] Futures connector task finished unexpectedly."),
-        _ = algorithm_handle => warn!("[Bot] Trading algorithm task finished unexpectedly."),
-        _ = order_watcher_handle => warn!("[Bot] Order watcher task finished unexpectedly."),
-        _ = position_manager_handle => warn!("[Bot] Position manager task finished unexpectedly."),
-        _ = cmd_listener_handle => warn!("[Bot] Command listener task finished unexpectedly."),
-        _ = redis_dispatcher_handle => warn!("[Bot] Redis event dispatcher task finished unexpectedly."),
+        // Причина 2: Одна из критических задач завершилась неожиданно
+        res = &mut spot_handle => warn!("[Bot] Spot connector task finished unexpectedly: {:?}", res),
+        res = &mut futures_handle => warn!("[Bot] Futures connector task finished unexpectedly: {:?}", res),
+        res = &mut algorithm_handle => warn!("[Bot] Trading algorithm task finished unexpectedly: {:?}", res),
+        res = &mut order_watcher_handle => warn!("[Bot] Order watcher task finished unexpectedly: {:?}", res),
+        res = &mut position_manager_handle => warn!("[Bot] Position manager task finished unexpectedly: {:?}", res),
+        res = &mut cmd_listener_handle => warn!("[Bot] Command listener task finished unexpectedly: {:?}", res),
+        res = &mut compensator_handle => warn!("[Bot] Compensator task finished unexpectedly: {:?}", res),
+        res = &mut redis_dispatcher_handle => warn!("[Bot] Redis event dispatcher task finished unexpectedly: {:?}", res),
     }
 
-    info!("[Bot] Shutdown signal received. Waiting for tasks to complete...");
-    // Даем задачам немного времени на завершение
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    info!("[Bot] Application shut down gracefully.");
+    // --- ФИНАЛЬНЫЙ ЭТАП: ГАРАНТИРОВАННОЕ ЗАВЕРШЕНИЕ ---
+    info!("[Bot] Shutdown trigger detected. Notifying all tasks and waiting for completion...");
+
+    // 1. Убедимся, что сигнал точно был отправлен всем (на случай, если `select` завершился из-за падения задачи)
+    shutdown_notify.notify_waiters();
+
+    // 2. Устанавливаем таймаут на общее время завершения
+    let shutdown_timeout = Duration::from_secs(10);
+    let graceful_shutdown = async {
+        // Ожидаем завершения всех основных задач
+        // Используем отдельные join'ы с логированием для лучшей отладки
+        info!("[Bot] Waiting for tasks to finish...");
+        let (spot, fut, algo, watch, pos, cmd, comp, redis) = tokio::join!(
+            spot_handle, futures_handle, algorithm_handle, order_watcher_handle,
+            position_manager_handle, cmd_listener_handle, compensator_handle, redis_dispatcher_handle
+        ); 
+        info!("[Bot] Spot Connector finished: {:?}", spot);
+        info!("[Bot] Futures Connector finished: {:?}", fut);
+        info!("[Bot] Algorithm finished: {:?}", algo);
+        info!("[Bot] Order Watcher finished: {:?}", watch);
+        info!("[Bot] Position Manager finished: {:?}", pos);
+        info!("[Bot] Command Listener finished: {:?}", cmd);
+        info!("[Bot] Compensator finished: {:?}", comp);
+        info!("[Bot] Redis Dispatcher finished: {:?}", redis);
+    };
+
+    if tokio::time::timeout(shutdown_timeout, graceful_shutdown).await.is_err() {
+        warn!("[Bot] Shutdown timed out after {} seconds. Some tasks may not have terminated gracefully.", shutdown_timeout.as_secs());
+    } else {
+        info!("[Bot] All tasks terminated gracefully.");
+    }
+    // Задача-слушатель Ctrl+C будет отменена либо здесь, либо в command_listener.
+
+    info!("[Bot] Application has shut down.");
     Ok(())
 }
 
@@ -281,8 +335,8 @@ async fn redis_event_dispatcher_task(
     info!("[RedisDispatcher] Task starting. Subscribing to 'order_filled_events' and 'bot_commands'...");
 
     // Создаем соединение внутри задачи, чтобы оно было изолированным
-    let mut pubsub = match redis_client.get_tokio_connection().await {
-        Ok(conn) => conn.into_pubsub(),
+    let mut pubsub = match redis_client.get_async_connection().await {
+        Ok(conn) => conn.into_pubsub(), // get_async_connection is the modern replacement
         Err(e) => { error!("[RedisDispatcher] FATAL: Could not get Redis connection: {}", e); return; }
     };
 
@@ -343,16 +397,25 @@ async fn command_listener_task(
     app_state: Arc<AppState>,
     mut command_rx: mpsc::Receiver<WsCommand>,
     shutdown: Arc<Notify>,
+    shutdown_signal_task: tokio::task::JoinHandle<()>,
 ) {
     info!("[CommandListener] Task starting. Waiting for commands from dispatcher.");
 
     loop {
         tokio::select! {
+            // Приоритетно проверяем сигнал о завершении
+            biased;
+            _ = shutdown.notified() => {
+                info!("[CommandListener] Shutdown signal received. Exiting.");
+                break;
+            },
             Some(command) = command_rx.recv() => {
                 match command.action.as_str() {
                     "graceful_stop" => {
                         info!("[CommandListener] Received 'graceful_stop' command. Setting status to Stopping.");
                         app_state.inner.trading_status.store(TradingStatus::Stopping as u8, Ordering::SeqCst);
+                        shutdown.notify_waiters();
+                        shutdown_signal_task.abort(); // Отменяем задачу Ctrl+C, чтобы она не блокировала выход
                     },
                     "force_close" => {
                         if let Some(symbol) = command.symbol {
@@ -374,10 +437,6 @@ async fn command_listener_task(
                     }
                 }
             },
-            _ = shutdown.notified() => {
-                info!("[CommandListener] Shutdown signal received. Exiting.");
-                break;
-            }
         }
     }
     warn!("[CommandListener] Command channel closed. Task is finishing.");

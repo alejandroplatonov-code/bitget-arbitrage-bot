@@ -1,5 +1,6 @@
 use crate::orderbook::OrderBook;
 use serde::{Deserialize, Serialize};
+use crate::order_watcher::OrderType;
 use rust_decimal::Decimal;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -107,6 +108,22 @@ pub struct CompletedTrade {
     // НОВЫЕ ПОЛЯ
     pub entry_spread_percent: Decimal,
     pub exit_spread_percent: Decimal,
+}
+
+/// Describes a task for the compensator module to close an orphaned trade leg.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompensationTask {
+    pub symbol: String,
+    /// The ID of the order that was successfully placed and now needs compensation.
+    pub original_order_id: String,
+    /// The quantity of the base asset that was successfully bought or sold.
+    pub base_qty_to_compensate: Decimal,
+    /// The direction of the original, failed arbitrage attempt.
+    /// The compensator will execute the opposite action.
+    /// e.g., if original was BuySpot, compensation is SellSpot.
+    pub original_direction: ArbitrageDirection,
+    /// Which leg of the trade was successfully executed and now needs compensation.
+    pub leg_to_compensate: OrderType,
 }
 
 /// Событие, которое PositionManager публикует для внешних слушателей (например, монитора).
