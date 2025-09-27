@@ -1,0 +1,13 @@
+# Ignore compiled artifacts
+/target
+
+# Ignore secrets
+secrets.toml
+secrets_demo.toml
+
+# Ignore IDE files
+.vscode/
+.idea/
+
+# Ignore lock file
+Cargo.lock

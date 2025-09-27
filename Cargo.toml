@@ -1,0 +1,56 @@
+[package]
+name = "rust_template_for_testing"
+version = "0.1.1"
+edition = "2021"
+
+[lib]
+name = "rust_template_for_testing"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bot"
+path = "src/bin/bot.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "setup-environment"
+path = "src/bin/setup_environment.rs"
+
+# --- НОВЫЙ БЛОК ---
+[[bin]]
+name = "monitor"
+path = "src/bin/monitor.rs"
+
+# --- НОВЫЙ БЛОК ---
+[[bin]]
+name = "top-spreads"
+path = "src/bin/top_spreads.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.23.1", features = ["native-tls"] }
+futures = "0.3"
+futures-util = "0.3.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust_decimal = { version = "1.35", features = ["serde-with-float", "macros"] }
+toml = "0.8"
+crc32fast = "1.4.0"
+dashmap = "5.5.3"
+reqwest = { version = "0.12", features = ["json"] }
+hmac = "0.12.1"
+sha2 = "0.10.8"
+base64 = "0.22.1"
+chrono = "0.4.38"
+axum = { version = "0.7.5", features = ["ws"] }
+tower-http = { version = "0.5.2", features = ["fs"] }
+rayon = "1.8"
+redis = { version = "0.25.4", features = ["tokio-comp"] }
+crossterm = "0.27.0"
+uuid = { version = "1", features = ["v4"] }
