@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let compensator_handle = tokio::spawn(run_compensator(
         compensation_rx,
         api_client.clone(),
-        app_state.clone(),
+        app_state.clone(), // Передаем app_state в компенсатор
         shutdown_notify.clone(),
     ));
     info!("[Bot] Compensator started.");

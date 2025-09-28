@@ -192,10 +192,14 @@ async fn handle_open_position(
  
                         // --- ЭТАП 2: Формируем и отправляем ордера ПАРАЛЛЕЛЬНО ---
                         info!("[{}] Closing Step 2: Sending close orders in parallel.", symbol);
-                        const GLOBAL_QUANTITY_SCALE: u32 = 4;
                         let client_oid = uuid::Uuid::new_v4().to_string();
  
-                        let spot_close_qty = actual_spot_balance.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                        // --- ИСПРАВЛЕНИЕ: Используем правила округления для спота ---
+                        // Если правила не найдены, используем безопасное значение по умолчанию (например, 2),
+                        // но лучше убедиться, что правила загружаются для всех пар.
+                        let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
+
+                        let spot_close_qty = actual_spot_balance.trunc_with_scale(spot_quantity_scale);
                         
                         // --- КЛЮЧЕВАЯ ПОПРАВКА ---
                         // Откупаем на фьючерсах ровно столько, сколько продаем на споте, чтобы свести дельту в ноль.

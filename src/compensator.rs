@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 pub async fn run_compensator(
     mut task_rx: mpsc::Receiver<CompensationTask>,
     api_client: Arc<ApiClient>,
-    _app_state: Arc<AppState>, // Not used, but kept for signature consistency
+    app_state: Arc<AppState>,
     shutdown: Arc<Notify>,
 ) {
     info!("[Compensator] Service started. Waiting for compensation tasks...");
@@ -32,8 +32,9 @@ pub async fn run_compensator(
                 // --- ИЗМЕНЕНИЕ 2: Запускаем задачу внутри управляемого JoinSet ---
                 compensation_tasks.spawn({
                     let client = api_client.clone();
+                    let state = app_state.clone();
                     async move {
-                        handle_compensation_task(task, client).await;
+                        handle_compensation_task(task, client, state).await;
                     }
                 });
             },
@@ -59,24 +60,33 @@ pub async fn run_compensator(
 async fn handle_compensation_task(
     task: CompensationTask,
     api_client: Arc<ApiClient>,
+    app_state: Arc<AppState>,
 ) {
     let mut attempts = 0;
     loop {
         attempts += 1;
         warn!("[Compensator] Attempt #{} to compensate leg for {} (original order ID: {})", attempts, task.symbol, task.original_order_id);
 
-        const GLOBAL_QUANTITY_SCALE: u32 = 4;
+        // --- ИСПРАВЛЕНИЕ: Получаем правила округления из AppState ---
+        let rules = app_state.inner.symbol_rules.get(&task.symbol)
+            .map(|r| *r.value())
+            .unwrap_or_default();
 
         let result: Result<_, _> = match (task.leg_to_compensate, task.original_direction) {
             // Original was BuySpot, so we need to SellSpot.
             (OrderType::Spot, ArbitrageDirection::BuySpotSellFutures) => {
-                let qty = task.base_qty_to_compensate.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                // Используем правило для спота, с фолбэком на 2
+                let scale = rules.spot_quantity_scale.unwrap_or(2);
+                let qty = task.base_qty_to_compensate.trunc_with_scale(scale);
                 let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: "sell".to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
                 api_client.place_spot_order(req).await.map(|_| ())
             },
             // Original was SellFutures, so we need to BuyFutures.
             (OrderType::Futures, ArbitrageDirection::BuySpotSellFutures) => {
-                let qty = task.base_qty_to_compensate.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                // Для фьючерсов обычно используется другое правило, но для компенсации используем то же количество.
+                // Предположим, что для фьючерсов 4 знака - это нормально.
+                const FUTURES_QUANTITY_SCALE: u32 = 4;
+                let qty = task.base_qty_to_compensate.trunc_with_scale(FUTURES_QUANTITY_SCALE);
                 let req = PlaceFuturesOrderRequest { symbol: task.symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(), margin_coin: "USDT".to_string(), size: qty.to_string(), side: "buy".to_string(), trade_side: None, order_type: "market".to_string(), client_oid: None };
                 api_client.place_futures_order(req).await.map(|_| ())
             },
