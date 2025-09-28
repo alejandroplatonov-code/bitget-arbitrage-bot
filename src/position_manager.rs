@@ -2,11 +2,10 @@
 
 use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
-use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
+use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, PositionState};
 use dashmap::DashMap;
 use rust_decimal::{Decimal, prelude::FromStr};
-use std::sync::{Arc};
-use std::time::Instant;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -89,7 +88,6 @@ async fn handle_entry_fill(
             futures_entry_vwap: futures_price,
             current_state: Default::default(),
             entry_spread_percent,
-            created_at: Instant::now(), // <-- Устанавливаем время создания
         };
 
         // Сохраняем в локальном состоянии

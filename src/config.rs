@@ -29,6 +29,7 @@ pub struct Config {
 
     // НОВОЕ ПОЛЕ
     pub max_active_positions: usize,
+    pub position_cooldown_seconds: u64,
 
     // NEW FIELD
     #[serde(skip)] // This field is not from config.toml

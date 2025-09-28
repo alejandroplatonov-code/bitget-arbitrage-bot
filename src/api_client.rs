@@ -1,6 +1,8 @@
 use crate::error::AppError;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
+use std::str::FromStr;
+use rust_decimal::Decimal;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method, RequestBuilder};
 use std::time::Duration;
@@ -75,6 +77,15 @@ pub struct FuturesOrderInfo {
     pub price_avg: String,
     pub base_volume: String, // Исполненный объем
     pub client_oid: Option<String>,
+}
+
+/// --- НОВЫЕ СТРУКТУРЫ ДЛЯ БАЛАНСА ---
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotAccountAsset {
+    pub coin: String,
+    pub available: String, // Нам нужен именно доступный для торговли баланс
+    // ... (frozen, lock - нам не нужны)
 }
 
 /// Structure for setting margin mode.
@@ -303,6 +314,28 @@ impl ApiClient {
             client_oid: fut_info.client_oid,
         }).ok_or_else(|| AppError::ApiError(api_response.code, api_response.msg))
     }
+
+    /// --- НОВАЯ ФУНКЦИЯ В impl ApiClient ---
+    /// Gets spot account balance for a specific coin.
+    pub async fn get_spot_balance(&self, coin: &str) -> Result<Decimal, AppError> {
+        let path = "/api/v2/spot/account/assets";
+        let params = format!("coin={}", coin);
+
+        let builder = self.create_signed_get_request(path, &params)?;
+        let response = builder.send().await?;
+
+        let api_response: ApiResponse<Vec<SpotAccountAsset>> = response.json().await?;
+
+        if api_response.code != "00000" {
+            return Err(AppError::ApiError(api_response.code, api_response.msg));
+        }
+
+        api_response.data
+            .and_then(|mut assets| assets.pop()) // Берем первый (и единственный) элемент из массива
+            .and_then(|asset| Decimal::from_str(&asset.available).ok()) // Парсим `available` в Decimal
+            .ok_or_else(|| AppError::LogicError(format!("Could not find or parse available balance for {}", coin)))
+    }
+
 
     /// Sets the margin mode for a futures symbol.
     pub async fn set_margin_mode(&self, req: SetMarginModeRequest) -> Result<(), AppError> {
