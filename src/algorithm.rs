@@ -4,11 +4,11 @@ use crate::api_client::{ApiClient, PlaceFuturesOrderRequest, PlaceOrderRequest};
 use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
-use crate::trading_logic::{self, round_down};
+use crate::trading_logic;
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, CompensationTask, PairData, TradingStatus};
 use crate::utils::send_cancellable; //
 use futures_util::{future::Either, FutureExt};
-use rust_decimal::{Decimal, prelude::Zero};
+use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::atomic::{Ordering};
 use std::sync::Arc;
@@ -352,8 +352,8 @@ fn check_and_execute_arbitrage( // No longer async
     };
 
     // 2. Calculate base quantity N and round it down to 4 decimal places.
-    let base_qty_n_unrounded = config.trade_amount_usdt / last_price;
-    let base_qty_n = round_down(base_qty_n_unrounded, 4);
+    // The quantity is rounded down later when creating the order request.
+    let base_qty_n = config.trade_amount_usdt / last_price;
 
     // 3. Calculate VWAP for this rounded N.
     if let Some(sell_futures_res) =

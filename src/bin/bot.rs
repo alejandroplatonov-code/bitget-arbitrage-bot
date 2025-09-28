@@ -30,19 +30,10 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[derive(Deserialize, Debug)]
 struct SpotSymbolInfo {
     symbol: String,
-    #[serde(rename = "quantityScale")]
-    quantity_scale: Option<String>,
-    #[serde(rename = "priceScale")]
-    price_scale: Option<String>,
-    #[serde(rename = "minTradeAmount")]
-    min_trade_amount: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct FuturesSymbolInfo {
-    symbol: String,
-    #[serde(rename = "sizeMultiplier")]
-    size_multiplier: String,
+    #[serde(rename = "quantityScale", default)]
+    quantity_scale: String,
+    #[serde(rename = "minTradeAmount", default)]
+    min_trade_amount: String,
 }
 
 #[tokio::main]
@@ -255,20 +246,19 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     let mut missing_scale_symbols = Vec::new();
     for spot_info in spot_symbols {
         let mut rules = app_state.inner.symbol_rules.entry(spot_info.symbol.clone()).or_default();
-
-        match spot_info.quantity_scale.and_then(|s| s.parse::<u32>().ok()) {
-            Some(s) => rules.spot_quantity_scale = Some(s),
-            None => {
-                missing_scale_symbols.push(spot_info.symbol.clone());
-                rules.spot_quantity_scale = Some(6);
+ 
+        match spot_info.quantity_scale.parse::<u32>() {
+            Ok(s) => rules.spot_quantity_scale = Some(s),
+            Err(_) => {
+                if !spot_info.quantity_scale.is_empty() { // Only warn if it's not empty but fails to parse
+                    missing_scale_symbols.push(spot_info.symbol.clone());
+                }
+                rules.spot_quantity_scale = Some(6); // Fallback
             }
         }
-
-        if let Some(min_amount_str) = spot_info.min_trade_amount {
-            if let Ok(min_amount) = Decimal::from_str(&min_amount_str) {
+        if let Ok(min_amount) = Decimal::from_str(&spot_info.min_trade_amount) {
                 rules.min_trade_amount = Some(min_amount);
             }
-        }
     }
     if !missing_scale_symbols.is_empty() {
         warn!("[RulesLoader] {} spot symbols are missing 'quantityScale' and will use a fallback scale of 6. Examples: {:?}", missing_scale_symbols.len(), &missing_scale_symbols[..5.min(missing_scale_symbols.len())]);
@@ -280,7 +270,7 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     if futures_rules_data["code"].as_str() != Some("00000") {
         return Err(AppError::LogicError(format!("Failed to fetch futures rules: {}", futures_rules_data["msg"])));
     }
-    let _futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
+    // let _futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
 
     // --- Verification ---
     let trading_pairs = load_token_list()?;
@@ -310,10 +300,12 @@ async fn redis_event_dispatcher_task(
 ) {
     info!("[RedisDispatcher] Task starting. Subscribing to 'order_filled_events' and 'bot_commands'...");
 
+    // For Pub/Sub, a dedicated connection is required.
+    #[allow(deprecated)]
     let mut pubsub = match redis_client.get_async_connection().await {
         Ok(conn) => conn.into_pubsub(),
         Err(e) => {
-            error!("[RedisDispatcher] FATAL: Could not get Redis connection: {}", e);
+            error!("[RedisDispatcher] FATAL: Could not get Redis async connection for PubSub: {}", e);
             return;
         }
     };

@@ -12,10 +12,6 @@ name = "bot"
 path = "src/bin/bot.rs"
 
 [[bin]]
-name = "server"
-path = "src/bin/server.rs"
-
-[[bin]]
 name = "setup-environment"
 path = "src/bin/setup_environment.rs"
 
