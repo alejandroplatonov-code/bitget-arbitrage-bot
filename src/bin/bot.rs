@@ -4,8 +4,7 @@ use rust_template_for_testing::{
     algorithm::run_trading_algorithm,
     api_client::ApiClient,
     compensator::run_compensator,
-    config::Config,
-    config::load_token_list,
+    config::{load_token_list, Config},
     connectors::bitget::BitgetConnector,
     error::AppError,
     order_watcher::{run_order_watcher, OrderFilledEvent},
@@ -13,11 +12,10 @@ use rust_template_for_testing::{
     state::AppState,
     types::{TradingStatus, WsCommand},
 };
-use rust_decimal::Decimal;
 use futures_util::future::FutureExt;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::str::FromStr;
+use rust_decimal::Decimal;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +24,7 @@ use tokio::sync::Notify;
 use tracing::{error, info, trace, warn};
 use tracing_appender::rolling;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use std::str::FromStr;
 
 #[derive(Deserialize, Debug)]
 struct SpotSymbolInfo {
@@ -365,7 +364,7 @@ async fn command_listener_task(
     app_state: Arc<AppState>,
     mut command_rx: mpsc::Receiver<WsCommand>,
     shutdown: Arc<Notify>,
-    _shutdown_signal_task: tokio::task::JoinHandle<()>,
+    _shutdown_signal_task: tokio::task::JoinHandle<()>, // Kept for API compatibility, but unused
 ) {
     info!("[CommandListener] Task starting. Waiting for commands from dispatcher.");
 
