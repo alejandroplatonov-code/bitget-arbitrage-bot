@@ -19,10 +19,15 @@ use futures_util::future::FutureExt;
 use futures_util::StreamExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tracing::Level;
+use tracing_appender::rolling;
 use tokio::sync::mpsc;
-use tracing::{error, info, trace, warn, Level};
+use tracing::{error, info, trace, warn};
 use tokio::sync::Notify;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{
+    fmt::{self, writer::MakeWriterExt},
+    prelude::*,
+    EnvFilter,};
 use serde::Deserialize;
 #[derive(Deserialize, Debug)]
 struct SpotSymbolInfo {
@@ -43,10 +48,33 @@ struct FuturesSymbolInfo {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 1. Инициализация Логирования ---
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // Создаем файловый аппендер с ежедневной ротацией.
+    // Логи будут сохраняться в директорию `logs` с именами `bot.log.YYYY-MM-DD`.
+    let file_appender = rolling::daily("logs", "bot.log");
+
+    // Делаем запись в файл неблокирующей для максимальной производительности.
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Создаем фильтр для уровней логирования.
+    // По умолчанию будет использоваться "info". Можно переопределить через переменную окружения RUST_LOG.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Собираем "пайплайн" логирования.
+    tracing_subscriber::registry()
+        .with(filter) // Сначала применяем фильтр уровней
+        .with(
+            // Слой №1: Вывод в стандартный вывод (консоль) с поддержкой цветов.
+            fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(true),
+        )
+        .with(
+            // Слой №2: Вывод в неблокирующий файл без цветовых кодов.
+            fmt::layer()
+                .with_writer(non_blocking_file)
+                .with_ansi(false),
+        )
+        .init(); // Устанавливаем и активируем глобальный обработчик логов.
 
     info!("[Bot] Trading Bot starting...");
 

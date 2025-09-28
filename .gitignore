@@ -13,3 +13,6 @@ secrets_demo.toml
 Cargo.lock
 
 # config.toml
+
+# Директория с логами
+/logs

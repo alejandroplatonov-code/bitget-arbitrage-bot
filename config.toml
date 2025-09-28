@@ -1,5 +1,5 @@
 # Сумма одной сделки в USDT
-trade_amount_usdt = 8
+trade_amount_usdt = 6
 
 # Минимальный чистый процентный спред для входа в сделку
 spread_threshold_percent = 1
