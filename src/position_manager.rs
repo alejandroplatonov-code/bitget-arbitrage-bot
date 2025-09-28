@@ -2,7 +2,7 @@
 
 use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
-use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, PositionState};
+use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
 use dashmap::DashMap;
 use rust_decimal::{Decimal, prelude::FromStr};
 use std::sync::Arc;

@@ -6,7 +6,7 @@ use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
 use crate::trading_logic::{self, round_down};
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, CompensationTask, PairData, TradingStatus};
-use crate::utils::send_cancellable;
+use crate::utils::send_cancellable; //
 use futures_util::{future::Either, FutureExt};
 use rust_decimal::{Decimal, prelude::Zero};
 use std::sync::atomic::{Ordering};
@@ -101,8 +101,8 @@ async fn handle_open_position(
         Some(data) => data,
         None => return,
     };
-
-    // Рассчитываем параметры для симуляции закрытия
+ 
+    // Рассчитываем параметры для симуляции закрытия и обновления PnL
     let (r_exit_opt, c_exit_opt) = match position.direction {
         ArbitrageDirection::BuySpotSellFutures => (
             trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, position.spot_base_qty),
@@ -115,11 +115,11 @@ async fn handle_open_position(
         let revenue_spot_exit = r_exit_res.total_quote_qty;
         let cost_futures_exit = c_exit_res.total_quote_qty;
  
-        // --- УПРОЩЕННАЯ ПРОВЕРКА ---
+        // --- ПРОВЕРКА УСЛОВИЙ ВЫХОДА ---
         let close_reason: Option<&'static str> = 
             if app_state.inner.force_close_requests.remove(symbol).is_some() {
                 Some("Force Closed by User")
-            } else if revenue_spot_exit >= cost_futures_exit { // Простое условие безубыточности
+            } else if revenue_spot_exit >= cost_futures_exit { // Условие безубыточности или лучше
                 Some("Favorable Exit")
             } else {
                 None
@@ -148,10 +148,10 @@ async fn handle_open_position(
                     async move {
                         // --- НОВАЯ ЛОГИКА ЗАКРЫТИЯ ---
 
-                        // --- ЭТАП 1: Получаем ФАКТИЧЕСКИЙ спотовый баланс ---
-                        info!("[{}] Closing Step 1: Fetching actual spot balance.", symbol);
+                        // --- ЭТАП 1: Получаем ФАКТИЧЕСКИЙ спотовый баланс с ретраями ---
+                        info!("[{}] Closing Step 1: Fetching actual spot balance...", symbol);
                         let base_coin = position.symbol.replace("USDT", "");
-                        info!("[{}] Requesting available balance for coin: {}", symbol, base_coin);
+                        
                         let actual_spot_balance = match client.get_spot_balance(&base_coin).await {
                             Ok(balance) => {
                                 info!("[{}] Closing Step 1 SUCCESS: Actual available spot balance is {}.", symbol, balance);
@@ -163,16 +163,16 @@ async fn handle_open_position(
                                 return;
                             }
                         };
-
+ 
                         // --- ЭТАП 2: Формируем и отправляем ордера АСИНХРОННО (параллельно) ---
                         info!("[{}] Closing Step 2: Sending close orders in parallel.", symbol);
                         const GLOBAL_QUANTITY_SCALE: u32 = 4;
                         let client_oid = uuid::Uuid::new_v4().to_string();
-
+ 
                         // Используем фактический баланс для спота
                         let spot_close_qty = actual_spot_balance.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
-                        // Используем объем из позиции для фьючерса
-                        let futures_close_qty = position.futures_base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                        // Используем тот же объем для фьючерса, чтобы свести дельту в ноль
+                        let futures_close_qty = spot_close_qty;
 
                         // Если баланс спота нулевой, нам не нужно отправлять этот ордер.
                         let spot_task: Either<_, _> = if !spot_close_qty.is_zero() {
@@ -186,7 +186,7 @@ async fn handle_open_position(
                             };
                             client.place_spot_order(spot_order_req).left_future()
                         } else {
-                            info!("[{}] Closing Step 2 SKIPPED: No available spot balance to close.", symbol);
+                            info!("[{}] Closing Step 2 SKIPPED: Zero available spot balance to close.", symbol);
                             futures::future::ready(Err(crate::error::AppError::LogicError("Zero spot balance".to_string()))).right_future()
                         };
 
@@ -205,7 +205,7 @@ async fn handle_open_position(
                             client.place_futures_order(futures_order_req)
                         };
 
-                        let (spot_res, fut_res) = tokio::join!(spot_task, fut_task);
+                        let (spot_res, fut_res) = tokio::join!(spot_task, fut_task); // Запускаем параллельно
 
                         // --- ЭТАП 3: Обрабатываем результаты ---
                         // Логика компенсации остается такой же, как и раньше
@@ -224,13 +224,13 @@ async fn handle_open_position(
                             },
                             (Err(e_spot), Ok(fut_ord)) => {
                                 error!("[{}] LEGGING RISK ON CLOSE: Placed FUTURES order {} but FAILED to place SPOT order: {:?}. Delegating to compensator.", symbol, &fut_ord.order_id, e_spot);
-                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id.clone(), base_qty_to_compensate: position.futures_base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
+                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id.clone(), base_qty_to_compensate: futures_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
                                 if !send_cancellable(&compensation_tx, task, &shutdown).await {
                                     error!("[{}] CRITICAL: Failed to send CLOSE compensation task for SPOT leg!", symbol);
                                 }
                             },
                             (Ok(spot_ord), Err(e_fut)) => {
-                                error!("[{}] LEGGING RISK ON CLOSE: Placed SPOT order {} but FAILED to place FUTURES order: {:?}. Delegating to compensator.", symbol, &spot_ord.order_id, e_fut);
+                                error!("[{}] LEGGING RISK ON CLOSE: Placed SPOT order {} but FAILED to place FUTURES order: {:?}. Delegating to compensator.", symbol, &spot_ord.order_id, e_fut);                                
                                 let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id.clone(), base_qty_to_compensate: spot_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
                                 if !send_cancellable(&compensation_tx, task, &shutdown).await {
                                     error!("[{}] CRITICAL: Failed to send CLOSE compensation task for FUTURES leg!", symbol);

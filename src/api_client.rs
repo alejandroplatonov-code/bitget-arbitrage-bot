@@ -81,6 +81,7 @@ pub struct FuturesOrderInfo {
 
 /// --- НОВЫЕ СТРУКТУРЫ ДЛЯ БАЛАНСА ---
 #[derive(Deserialize, Debug)]
+#[derive(Clone)] // Добавляем Clone для возможности клонирования в логировании
 #[serde(rename_all = "camelCase")]
 pub struct SpotAccountAsset {
     pub coin: String,
@@ -330,10 +331,18 @@ impl ApiClient {
             return Err(AppError::ApiError(api_response.code, api_response.msg));
         }
 
-        api_response.data
-            .and_then(|mut assets| assets.pop()) // Берем первый (и единственный) элемент из массива
-            .and_then(|asset| Decimal::from_str(&asset.available).ok()) // Парсим `available` в Decimal
-            .ok_or_else(|| AppError::LogicError(format!("Could not find or parse available balance for {}", coin)))
+        // Заимствуем `data` через `as_ref`, чтобы не перемещать его из `api_response`.
+        let balance_opt = api_response.data.as_ref()
+            .and_then(|assets| assets.first()) // Безопасно берем ссылку на первый элемент
+            .and_then(|asset| Decimal::from_str(&asset.available).ok()); // Парсим `available` в Decimal
+
+        if let Some(balance) = balance_opt {
+            Ok(balance)
+        } else {
+            // Теперь `api_response` полностью доступна для логирования.
+            tracing::warn!("[ApiClient] get_spot_balance for '{}' returned success code but data array was empty or balance could not be parsed. API Response: {:?}", coin, &api_response);
+            Err(AppError::LogicError(format!("Could not find or parse available balance for {}", coin)))
+        }
     }
 
 
