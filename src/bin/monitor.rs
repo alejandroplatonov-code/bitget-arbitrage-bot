@@ -19,14 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut completed_trades: Vec<CompletedTrade> = Vec::new();
 
     let redis_client = redis::Client::open("redis://127.0.0.1/")?;
-    // For Pub/Sub, a dedicated connection is required. get_async_connection is deprecated
-    // but is the correct choice here for a connection that will be converted to Pub/Sub.
+    // For Pub/Sub, a dedicated connection is required. `get_async_connection` is deprecated
+    // but is the correct function to use for a connection that will be converted to Pub/Sub.
     #[allow(deprecated)]
-    let mut pubsub = redis_client.get_async_connection().await
-        .map_err(|e| {
-            error!("Failed to get async connection for PubSub: {}", e);
-            e
-        })?.into_pubsub();
+    let mut pubsub = redis_client.get_tokio_connection().await?.into_pubsub();
 
     info!("Successfully connected to Redis for PubSub.");
     pubsub.subscribe("trade_events").await?;

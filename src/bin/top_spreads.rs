@@ -11,7 +11,7 @@ use crossterm::{
 use rust_decimal::Decimal;
 use std::io::{stdout, Write};
 use std::sync::Arc; 
-use std::time::Duration;
+use std::time::{Duration};
 use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;

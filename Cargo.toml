@@ -11,11 +11,6 @@ path = "src/lib.rs"
 name = "bot"
 path = "src/bin/bot.rs"
 
-# The 'server' binary is removed as the source file does not exist.
-# [[bin]]
-# name = "server"
-# path = "src/bin/server.rs"
-
 [[bin]]
 name = "setup-environment"
 path = "src/bin/setup_environment.rs"

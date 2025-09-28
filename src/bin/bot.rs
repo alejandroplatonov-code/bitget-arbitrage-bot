@@ -12,13 +12,13 @@ use rust_template_for_testing::{
     state::AppState,
     types::{TradingStatus, WsCommand},
 };
-use futures_util::future::FutureExt;
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use rust_decimal::Decimal;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tracing::{error, info, trace, warn};
@@ -364,7 +364,7 @@ async fn command_listener_task(
     app_state: Arc<AppState>,
     mut command_rx: mpsc::Receiver<WsCommand>,
     shutdown: Arc<Notify>,
-    _shutdown_signal_task: tokio::task::JoinHandle<()>, // Kept for API compatibility, but unused
+    _shutdown_signal_task: tokio::task::JoinHandle<()>,
 ) {
     info!("[CommandListener] Task starting. Waiting for commands from dispatcher.");
 
