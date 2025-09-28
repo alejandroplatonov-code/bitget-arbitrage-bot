@@ -1,4 +1,4 @@
-// src/bin/bot.rs
+// /home/platon/Bot_Bit_Get_Rust/src/bin/bot.rs
 
 use rust_template_for_testing::{
     algorithm::run_trading_algorithm,
@@ -7,28 +7,26 @@ use rust_template_for_testing::{
     config::Config,
     config::load_token_list,
     connectors::bitget::BitgetConnector,
+    error::AppError,
     order_watcher::{run_order_watcher, OrderFilledEvent},
     position_manager::run_position_manager,
-    error::AppError,
-    state::AppState, // SymbolRules is fetched but only used inside algorithm.rs
+    state::AppState,
     types::{TradingStatus, WsCommand},
 };
-use rust_template_for_testing::utils::send_cancellable;
-use std::{time::Duration, str::FromStr};
+use rust_decimal::Decimal;
 use futures_util::future::FutureExt;
 use futures_util::StreamExt;
+use serde::Deserialize;
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::Level;
-use tracing_appender::rolling;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, trace, warn};
 use tokio::sync::Notify;
-use tracing_subscriber::{
-    fmt::{self, writer::MakeWriterExt},
-    prelude::*,
-    EnvFilter,};
-use serde::Deserialize;
+use tracing::{error, info, trace, warn};
+use tracing_appender::rolling;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
 #[derive(Deserialize, Debug)]
 struct SpotSymbolInfo {
     symbol: String,
@@ -36,6 +34,8 @@ struct SpotSymbolInfo {
     quantity_scale: Option<String>,
     #[serde(rename = "priceScale")]
     price_scale: Option<String>,
+    #[serde(rename = "minTradeAmount")]
+    min_trade_amount: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -48,33 +48,15 @@ struct FuturesSymbolInfo {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 1. Инициализация Логирования ---
-    // Создаем файловый аппендер с ежедневной ротацией.
-    // Логи будут сохраняться в директорию `logs` с именами `bot.log.YYYY-MM-DD`.
     let file_appender = rolling::daily("logs", "bot.log");
-
-    // Делаем запись в файл неблокирующей для максимальной производительности.
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
-
-    // Создаем фильтр для уровней логирования.
-    // По умолчанию будет использоваться "info". Можно переопределить через переменную окружения RUST_LOG.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Собираем "пайплайн" логирования.
     tracing_subscriber::registry()
-        .with(filter) // Сначала применяем фильтр уровней
-        .with(
-            // Слой №1: Вывод в стандартный вывод (консоль) с поддержкой цветов.
-            fmt::layer()
-                .with_writer(std::io::stdout)
-                .with_ansi(true),
-        )
-        .with(
-            // Слой №2: Вывод в неблокирующий файл без цветовых кодов.
-            fmt::layer()
-                .with_writer(non_blocking_file)
-                .with_ansi(false),
-        )
-        .init(); // Устанавливаем и активируем глобальный обработчик логов.
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stdout).with_ansi(true))
+        .with(fmt::layer().with_writer(non_blocking_file).with_ansi(false))
+        .init();
 
     info!("[Bot] Trading Bot starting...");
 
@@ -95,8 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (order_filled_tx, order_filled_rx) = mpsc::channel(256);
     let (bot_command_tx, bot_command_rx) = mpsc::channel(32);
     let (compensation_tx, compensation_rx) = mpsc::channel(64);
-    let redis_client = redis::Client::open(config.redis_url.as_str())?; // Client is clonable
-    let _redis_publisher = redis_client.get_multiplexed_tokio_connection().await?; // Keep for potential future use, but not for PM/Watcher
+    let redis_client = redis::Client::open(config.redis_url.as_str())?;
     info!("[Bot] Redis client initialized.");
 
     // --- 4. Инициализация API клиента ---
@@ -106,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.api_keys.api_passphrase.clone(),
     ));
 
-    // --- 5. Запуск коннекторов для получения данных ---
+    // --- 5. Загрузка правил торговли ---
     info!("[Bot] Fetching symbol trading rules...");
     if let Err(e) = fetch_and_store_symbol_rules(app_state.clone()).await {
         error!("[Bot] FATAL: Failed to fetch symbol rules: {}", e);
@@ -114,8 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     info!("[Bot] Symbol trading rules loaded successfully.");
 
-
-    // --- 5. Запуск коннекторов для получения данных ---
+    // --- 6. Запуск коннекторов для получения данных ---
     let trading_pairs = match load_token_list() {
         Ok(pairs) => pairs,
         Err(e) => {
@@ -125,12 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     info!("[Bot] Starting data connectors for {} pairs.", trading_pairs.len());
 
-    // --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
     let spot_connector = BitgetConnector::new(
         "SPOT".to_string(),
         trading_pairs.clone(),
         app_state.inner.clone(),
-        vec!["books".to_string()], // Оставляем только books
+        vec!["books".to_string()],
         orderbook_update_tx.clone(),
     );
 
@@ -138,11 +117,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "USDT-FUTURES".to_string(),
         trading_pairs,
         app_state.inner.clone(),
-        vec!["books".to_string()], // Оставляем только books
+        vec!["books".to_string()],
         orderbook_update_tx,
     );
 
-    // --- НОВЫЙ БЛОК: Механизм Graceful Shutdown ---
+    // --- 7. Механизм Graceful Shutdown ---
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_signal_task = {
         let notify = shutdown_notify.clone();
@@ -152,32 +131,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             notify.notify_waiters();
         })
     };
-    // --- КОНЕЦ БЛОКА --- // spot_connector is moved here
+
+    // --- 8. Запуск всех сервисов ---
     let spot_handle = tokio::spawn(spot_connector.run(shutdown_notify.clone()));
     info!("[Bot] Spot Connector spawned.");
 
     let futures_handle = tokio::spawn(futures_connector.run(shutdown_notify.clone()));
     info!("[Bot] Futures Connector spawned.");
 
-    // --- 6. Запуск наблюдателя за ордерами ---
     let order_watcher_handle = tokio::spawn(run_order_watcher(
         order_watch_rx,
         api_client.clone(),
-        order_filled_tx.clone(), // <-- ОТПРАВЛЯЕТ В MPSC
+        order_filled_tx.clone(),
         app_state.clone(),
-        shutdown_notify.clone()
+        shutdown_notify.clone(),
     ));
     info!("[Bot] Order Watcher started.");
 
-    // --- 7. Запуск менеджера позиций ---
     let position_manager_handle = tokio::spawn(run_position_manager(
-        app_state.clone(), 
-        order_filled_rx, // <-- ПРИНИМАЕТ ИЗ MPSC
-        shutdown_notify.clone()
+        app_state.clone(),
+        order_filled_rx,
+        shutdown_notify.clone(),
     ));
     info!("[Bot] Position Manager started.");
 
-    // --- NEW: Запуск компенсатора ---
     let compensator_handle = tokio::spawn(run_compensator(
         compensation_rx,
         api_client.clone(),
@@ -186,38 +163,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
     info!("[Bot] Compensator started.");
 
-    // --- 9. ЗАПУСК СЛУШАТЕЛЯ КОМАНД ---
-    let cmd_listener_handle = tokio::spawn(command_listener_task( // Now receives from mpsc
+    let cmd_listener_handle = tokio::spawn(command_listener_task(
         app_state.clone(),
-        bot_command_rx, // <-- ПРИНИМАЕТ ИЗ MPSC
+        bot_command_rx,
         shutdown_notify.clone(),
-        shutdown_signal_task.into() // Передаем JoinHandle в задачу
+        shutdown_signal_task.into(),
     ));
     info!("[Bot] Command Listener started.");
 
-    // --- НОВЫЙ БЛОК: Запуск единого диспетчера событий Redis ---
     let redis_dispatcher_handle = tokio::spawn(redis_event_dispatcher_task(
-        redis_client, // Pass the client itself
-        order_filled_tx, // Он будет писать в этот канал
+        redis_client,
+        order_filled_tx,
         bot_command_tx,
         shutdown_notify.clone(),
     ));
     info!("[Bot] Redis Event Dispatcher started.");
 
-    // --- 8. Запуск основного алгоритма ---
     let algorithm_handle = tokio::spawn(run_trading_algorithm(
         app_state.clone(),
-        config.clone(), // <-- ИЗМЕНЕНИЕ: Просто клонируем Arc
+        config.clone(),
         api_client.clone(),
         order_watch_tx,
         compensation_tx,
-        orderbook_update_rx, shutdown_notify.clone()
+        orderbook_update_rx,
+        shutdown_notify.clone(),
     ));
     info!("[Bot] Trading Algorithm started.");
 
-    // --- 10. ОЖИДАНИЕ ЗАВЕРШЕНИЯ И КОРРЕКТНАЯ ОСТАНОВКА ---
-    // `&mut` используется, чтобы `select!` не забирал владение над JoinHandle'ами.
-    // let mut shutdown_signal_task = shutdown_signal_task; // Больше не нужна здесь, т.к. передана в listener
+    // --- 9. Ожидание завершения ---
     let mut spot_handle = spot_handle;
     let mut futures_handle = futures_handle;
     let mut algorithm_handle = algorithm_handle;
@@ -228,7 +201,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut redis_dispatcher_handle = redis_dispatcher_handle;
 
     tokio::select! {
-        // Причина 2: Одна из критических задач завершилась неожиданно
         res = &mut spot_handle => warn!("[Bot] Spot connector task finished unexpectedly: {:?}", res),
         res = &mut futures_handle => warn!("[Bot] Futures connector task finished unexpectedly: {:?}", res),
         res = &mut algorithm_handle => warn!("[Bot] Trading algorithm task finished unexpectedly: {:?}", res),
@@ -239,22 +211,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         res = &mut redis_dispatcher_handle => warn!("[Bot] Redis event dispatcher task finished unexpectedly: {:?}", res),
     }
 
-    // --- ФИНАЛЬНЫЙ ЭТАП: ГАРАНТИРОВАННОЕ ЗАВЕРШЕНИЕ ---
+    // --- 10. Финальный этап завершения ---
     info!("[Bot] Shutdown trigger detected. Notifying all tasks and waiting for completion...");
-
-    // 1. Убедимся, что сигнал точно был отправлен всем (на случай, если `select` завершился из-за падения задачи)
     shutdown_notify.notify_waiters();
 
-    // 2. Устанавливаем таймаут на общее время завершения
     let shutdown_timeout = Duration::from_secs(10);
     let graceful_shutdown = async {
-        // Ожидаем завершения всех основных задач
-        // Используем отдельные join'ы с логированием для лучшей отладки
         info!("[Bot] Waiting for tasks to finish...");
         let (spot, fut, algo, watch, pos, cmd, comp, redis) = tokio::join!(
             spot_handle, futures_handle, algorithm_handle, order_watcher_handle,
             position_manager_handle, cmd_listener_handle, compensator_handle, redis_dispatcher_handle
-        ); 
+        );
         info!("[Bot] Spot Connector finished: {:?}", spot);
         info!("[Bot] Futures Connector finished: {:?}", fut);
         info!("[Bot] Algorithm finished: {:?}", algo);
@@ -270,7 +237,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         info!("[Bot] All tasks terminated gracefully.");
     }
-    // Задача-слушатель Ctrl+C будет отменена либо здесь, либо в command_listener.
 
     info!("[Bot] Application has shut down.");
     Ok(())
@@ -289,13 +255,18 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     let mut missing_scale_symbols = Vec::new();
     for spot_info in spot_symbols {
         let mut rules = app_state.inner.symbol_rules.entry(spot_info.symbol.clone()).or_default();
-        
-        // Оставляем только quantityScale для спота, так как он нужен для закрытия
+
         match spot_info.quantity_scale.and_then(|s| s.parse::<u32>().ok()) {
             Some(s) => rules.spot_quantity_scale = Some(s),
             None => {
-                missing_scale_symbols.push(spot_info.symbol);
+                missing_scale_symbols.push(spot_info.symbol.clone());
                 rules.spot_quantity_scale = Some(6);
+            }
+        }
+
+        if let Some(min_amount_str) = spot_info.min_trade_amount {
+            if let Ok(min_amount) = Decimal::from_str(&min_amount_str) {
+                rules.min_trade_amount = Some(min_amount);
             }
         }
     }
@@ -309,11 +280,9 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     if futures_rules_data["code"].as_str() != Some("00000") {
         return Err(AppError::LogicError(format!("Failed to fetch futures rules: {}", futures_rules_data["msg"])));
     }
-    let futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
+    let _futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
 
-    // Логика для futures_quantity_scale полностью удалена, так как мы используем глобальную константу.
-
-    // --- Verification (Optional but recommended) ---
+    // --- Verification ---
     let trading_pairs = load_token_list()?;
     let mut missing_rules_count = 0;
     for pair in trading_pairs {
@@ -332,21 +301,21 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     Ok(())
 }
 
-
 /// A central hub for all incoming Redis Pub/Sub events.
-/// It listens on multiple channels and forwards messages to the appropriate handlers via mpsc channels.
 async fn redis_event_dispatcher_task(
-    redis_client: redis::Client, // <-- Принимаем клиент
+    redis_client: redis::Client,
     order_filled_tx: mpsc::Sender<OrderFilledEvent>,
     bot_command_tx: mpsc::Sender<WsCommand>,
     shutdown: Arc<Notify>,
 ) {
     info!("[RedisDispatcher] Task starting. Subscribing to 'order_filled_events' and 'bot_commands'...");
 
-    // Создаем соединение внутри задачи, чтобы оно было изолированным
     let mut pubsub = match redis_client.get_async_connection().await {
-        Ok(conn) => conn.into_pubsub(), // get_async_connection is the modern replacement
-        Err(e) => { error!("[RedisDispatcher] FATAL: Could not get Redis connection: {}", e); return; }
+        Ok(conn) => conn.into_pubsub(),
+        Err(e) => {
+            error!("[RedisDispatcher] FATAL: Could not get Redis connection: {}", e);
+            return;
+        }
     };
 
     if let Err(e) = pubsub.subscribe(&["order_filled_events", "bot_commands"]).await {
@@ -364,9 +333,7 @@ async fn redis_event_dispatcher_task(
             Some(msg) = stream.next() => {
                 trace!("[RedisDispatcher] Received message from Redis Pub/Sub.");
                 let channel = msg.get_channel_name();
-                let payload: Result<String, _> = msg.get_payload();
-
-                if let Ok(payload_str) = payload {
+                if let Ok(payload_str) = msg.get_payload::<String>() {
                     match channel {
                         "order_filled_events" => {
                             if let Ok(event) = serde_json::from_str::<OrderFilledEvent>(&payload_str) {
@@ -401,18 +368,17 @@ async fn redis_event_dispatcher_task(
     warn!("[RedisDispatcher] Message stream ended. Task is finishing.");
 }
 
-/// Listens for commands on a Redis Pub/Sub channel and updates the application state.
+/// Listens for commands and updates the application state.
 async fn command_listener_task(
     app_state: Arc<AppState>,
     mut command_rx: mpsc::Receiver<WsCommand>,
     shutdown: Arc<Notify>,
-    shutdown_signal_task: tokio::task::JoinHandle<()>,
+    _shutdown_signal_task: tokio::task::JoinHandle<()>,
 ) {
     info!("[CommandListener] Task starting. Waiting for commands from dispatcher.");
 
     loop {
         tokio::select! {
-            // Приоритетно проверяем сигнал о завершении
             biased;
             _ = shutdown.notified() => {
                 info!("[CommandListener] Shutdown signal received. Exiting.");
@@ -423,9 +389,6 @@ async fn command_listener_task(
                     "graceful_stop" => {
                         info!("[CommandListener] Received 'graceful_stop' command. Setting status to 'Stopping'. The bot will shut down after closing all positions.");
                         app_state.inner.trading_status.store(TradingStatus::Stopping as u8, Ordering::SeqCst);
-                        // НЕ вызываем shutdown.notify_waiters()!
-                        // Просто переводим бота в режим "только закрытие".
-                        // Алгоритм сам инициирует остановку, когда закроет все позиции.
                     },
                     "force_close" => {
                         if let Some(symbol) = command.symbol {
@@ -437,7 +400,6 @@ async fn command_listener_task(
                     },
                     "force_close_all" => {
                         info!("[CommandListener] Received 'force_close_all' command. Flagging all active positions for closure.");
-                        // Проходим по всем активным позициям и добавляем их в `force_close_requests`
                         for entry in app_state.inner.active_positions.iter() {
                             app_state.inner.force_close_requests.insert(entry.key().clone());
                         }

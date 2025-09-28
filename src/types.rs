@@ -1,14 +1,16 @@
+// /home/platon/Bot_Bit_Get_Rust/src/types.rs
 use crate::orderbook::OrderBook;
-use serde::{Deserialize, Serialize};
 use crate::order_watcher::OrderType;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Правила округления для пары.
+/// Правила округления и торговли для пары.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SymbolRules {
     pub spot_quantity_scale: Option<u32>,
+    pub min_trade_amount: Option<Decimal>, // Порог "пыли" для спота
 }
 
 /// Represents the synchronization state of an order book for a single instrument.

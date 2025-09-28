@@ -1,4 +1,4 @@
-// src/algorithm.rs
+// /home/platon/Bot_Bit_Get_Rust/src/algorithm.rs
 
 use crate::api_client::{ApiClient, PlaceFuturesOrderRequest, PlaceOrderRequest};
 use crate::config::Config;
@@ -9,11 +9,12 @@ use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, Compensat
 use crate::utils::send_cancellable; //
 use futures_util::{future::Either, FutureExt};
 use rust_decimal::{Decimal, prelude::Zero};
+use std::str::FromStr;
 use std::sync::atomic::{Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant}; // No change needed here, but for context
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Runs the main trading algorithm loop. This is the "hot path".
 /// It synchronously processes market data updates to minimize latency.
@@ -146,32 +147,58 @@ async fn handle_open_position(
                     let shutdown = shutdown.clone();
  
                     async move {
-                        // --- НОВАЯ ЛОГИКА ЗАКРЫТИЯ ---
+                        // --- НОВАЯ, ФИНАЛЬНАЯ ЛОГИКА ЗАКРЫТИЯ ---
+
+                        // Получаем правила для символа ОДИН РАЗ перед циклом
+                        let rules = app_state.inner.symbol_rules.get(&symbol)
+                            .map(|r| *r.value())
+                            .unwrap_or_default();
+
+                        // Определяем порог "пыли". Если правило не загрузилось, используем безопасный фолбэк.
+                        let dust_threshold = rules.min_trade_amount
+                            .unwrap_or_else(|| Decimal::from_str("0.0001").unwrap());
 
                         // --- ЭТАП 1: Получаем ФАКТИЧЕСКИЙ спотовый баланс с ретраями ---
                         info!("[{}] Closing Step 1: Fetching actual spot balance...", symbol);
                         let base_coin = position.symbol.replace("USDT", "");
                         
-                        let actual_spot_balance = match client.get_spot_balance(&base_coin).await {
-                            Ok(balance) => {
-                                info!("[{}] Closing Step 1 SUCCESS: Actual available spot balance is {}.", symbol, balance);
-                                balance
-                            },
-                            Err(e) => {
-                                error!("[{}] Closing Step 1 FAILED: Could not fetch spot balance: {:?}. Aborting close attempt.", symbol, e);
-                                app_state.inner.executing_pairs.remove(&symbol); // Снимаем блокировку
+                        let mut attempts = 0;
+                        let actual_spot_balance = loop {
+                            attempts += 1;
+                            info!("[{}] Attempt #{} to fetch spot balance for {}", symbol, attempts, base_coin);
+
+                            match client.get_spot_balance(&base_coin).await {
+                                Ok(balance) => {
+                                    if balance >= dust_threshold {
+                                        info!("[{}] Closing Step 1 SUCCESS: Actual balance {} is >= min_trade_amount {}.", symbol, balance, dust_threshold);
+                                        break balance; // Выходим из цикла, возвращая баланс
+                                    } else {
+                                        warn!("[{}] Fetched zero or dust balance ({} is < min_trade_amount {}). Retrying...", symbol, balance, dust_threshold);
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("[{}] Could not fetch spot balance: {:?}. Retrying in 1 second...", symbol, e);
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                            }
+
+                            if attempts >= 10 { // Защита от вечного цикла
+                                error!("[{}] Failed to fetch a valid spot balance after 10 attempts. Aborting close.", symbol);
+                                app_state.inner.executing_pairs.remove(&symbol);
                                 return;
                             }
                         };
  
-                        // --- ЭТАП 2: Формируем и отправляем ордера АСИНХРОННО (параллельно) ---
+                        // --- ЭТАП 2: Формируем и отправляем ордера ПАРАЛЛЕЛЬНО ---
                         info!("[{}] Closing Step 2: Sending close orders in parallel.", symbol);
                         const GLOBAL_QUANTITY_SCALE: u32 = 4;
                         let client_oid = uuid::Uuid::new_v4().to_string();
  
-                        // Используем фактический баланс для спота
                         let spot_close_qty = actual_spot_balance.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
-                        // Используем тот же объем для фьючерса, чтобы свести дельту в ноль
+                        
+                        // --- КЛЮЧЕВАЯ ПОПРАВКА ---
+                        // Откупаем на фьючерсах ровно столько, сколько продаем на споте, чтобы свести дельту в ноль.
                         let futures_close_qty = spot_close_qty;
 
                         // Если баланс спота нулевой, нам не нужно отправлять этот ордер.
