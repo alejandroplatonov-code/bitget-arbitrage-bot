@@ -80,7 +80,8 @@ async fn handle_entry_fill(
         let new_position = ActivePosition {
             symbol: spot_fill.symbol.clone(),
             direction: ArbitrageDirection::BuySpotSellFutures,
-            base_qty: Decimal::from_str(&spot_fill.base_volume).unwrap_or_default(),
+            futures_base_qty: Decimal::from_str(&futures_fill.base_volume).unwrap_or_default(),
+            spot_base_qty: Decimal::from_str(&spot_fill.base_volume).unwrap_or_default(),
             entry_time: chrono::Utc::now().timestamp_millis(),
             cost_spot_entry,
             revenue_futures_entry,

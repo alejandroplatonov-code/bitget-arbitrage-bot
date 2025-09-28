@@ -116,8 +116,8 @@ async fn handle_open_position(
     // Рассчитываем параметры для симуляции закрытия
     let (r_exit_opt, c_exit_opt) = match position.direction {
         ArbitrageDirection::BuySpotSellFutures => (
-            trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, position.base_qty),
-            trading_logic::calculate_cost_to_acquire(&pair_data.futures_book.asks, position.base_qty),
+            trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, position.spot_base_qty),
+            trading_logic::calculate_cost_to_acquire(&pair_data.futures_book.asks, position.futures_base_qty),
         ),
         _ => (None, None),
     };
@@ -154,10 +154,10 @@ async fn handle_open_position(
                 const GLOBAL_QUANTITY_SCALE: u32 = 4; // Глобальное правило: 4 знака
 
                 // Для market-sell на споте `size` - это объем в базовой валюте.
-                let spot_close_qty = position.base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                let spot_close_qty = position.spot_base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
 
                 // Для market-buy на фьючерсах `size` - это объем в базовой валюте.
-                let futures_close_qty = position.base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
+                let futures_close_qty = position.futures_base_qty.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
                 // --- КОНЕЦ: Логика округления для закрытия ---
 
                 let spot_order_req = PlaceOrderRequest {
@@ -226,7 +226,7 @@ async fn handle_open_position(
                             (Err(e_spot), Ok(fut_ord)) => {
                                 error!("!!! CLOSE FAILED (SPOT): {:?} !!!", e_spot);
                                 error!("[{}] LEGGING RISK ON CLOSE: Placed FUTURES order {} but FAILED to place SPOT order. Delegating to compensator.", symbol, &fut_ord.order_id);
-                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id.clone(), base_qty_to_compensate: position.base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
+                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id.clone(), base_qty_to_compensate: position.futures_base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
                                 if !send_cancellable(&compensation_tx, task, &shutdown).await {
                                     error!("[{}] CRITICAL: Failed to send CLOSE compensation task for SPOT leg!", symbol);
                                 }
@@ -235,7 +235,7 @@ async fn handle_open_position(
                             (Ok(spot_ord), Err(e_fut)) => {
                                 error!("!!! CLOSE FAILED (FUTURES): {:?} !!!", e_fut);
                                 error!("[{}] LEGGING RISK ON CLOSE: Placed SPOT order {} but FAILED to place FUTURES order. Delegating to compensator.", symbol, &spot_ord.order_id);
-                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id.clone(), base_qty_to_compensate: position.base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
+                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id.clone(), base_qty_to_compensate: position.spot_base_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
                                 if !send_cancellable(&compensation_tx, task, &shutdown).await {
                                     error!("[{}] CRITICAL: Failed to send CLOSE compensation task for FUTURES leg!", symbol);
                                 }
@@ -456,7 +456,17 @@ async fn execute_trade_task( // This new function runs in the background
         (Ok(spot_order), Err(e_fut)) => {
             error!("[{}] LEGGING RISK: Placed SPOT order {} but FAILED to place FUTURES order: {:?}. Sending to compensator.", symbol, &spot_order.order_id, e_fut);
             let spot_order_id = spot_order.order_id.clone(); // Клонируем перед move
-            let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_order.order_id, base_qty_to_compensate: rounded_futures_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
+            // We need to compensate the successful spot order. The quantity to compensate is not known yet,
+            // as the fill event hasn't happened. The best we can do is use the intended futures quantity,
+            // as spot was bought to match it. A more advanced implementation would wait for the spot fill
+            // to get the exact quantity. For now, this is the most logical value to use.
+            let task = CompensationTask {
+                symbol: symbol.clone(),
+                original_order_id: spot_order.order_id,
+                base_qty_to_compensate: rounded_futures_qty, // The intended quantity for the pair
+                original_direction: ArbitrageDirection::BuySpotSellFutures,
+                leg_to_compensate: OrderType::Spot,
+            };
             if !send_cancellable(&compensation_tx, task, &shutdown).await {
                 error!("[{}] CRITICAL: Failed to send compensation task for spot leg! Order ID: {}", symbol, spot_order_id);
             }
@@ -466,7 +476,13 @@ async fn execute_trade_task( // This new function runs in the background
         (Err(e_spot), Ok(futures_order)) => {
             error!("[{}] LEGGING RISK: Placed FUTURES order {} but FAILED to place SPOT order: {:?}. Sending to compensator.", symbol, &futures_order.order_id, e_spot);
             let futures_order_id = futures_order.order_id.clone(); // Клонируем перед move
-            let task = CompensationTask { symbol: symbol.clone(), original_order_id: futures_order.order_id, base_qty_to_compensate: rounded_futures_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
+            let task = CompensationTask {
+                symbol: symbol.clone(),
+                original_order_id: futures_order.order_id,
+                base_qty_to_compensate: rounded_futures_qty, // This was the actual quantity sent in the successful order
+                original_direction: ArbitrageDirection::BuySpotSellFutures,
+                leg_to_compensate: OrderType::Futures,
+            };
             if !send_cancellable(&compensation_tx, task, &shutdown).await {
                 error!("[{}] CRITICAL: Failed to send compensation task for futures leg! Order ID: {}", symbol, futures_order_id);
             }

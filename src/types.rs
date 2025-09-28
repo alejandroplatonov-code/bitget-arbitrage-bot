@@ -72,7 +72,8 @@ pub struct ActivePosition {
     pub symbol: String,
     pub direction: ArbitrageDirection,
     pub entry_time: i64,
-    pub base_qty: Decimal, // N
+    pub futures_base_qty: Decimal, // Фактический исполненный объем на фьючерсах
+    pub spot_base_qty: Decimal,    // Фактический исполненный объем на споте
 
     // ПЕРЕИМЕНОВАННЫЕ ПОЛЯ, соответствующие Единой Системе
     pub cost_spot_entry: Decimal,

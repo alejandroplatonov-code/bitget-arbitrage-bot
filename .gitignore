@@ -11,3 +11,5 @@ secrets_demo.toml
 
 # Ignore lock file
 Cargo.lock
+
+# config.toml
