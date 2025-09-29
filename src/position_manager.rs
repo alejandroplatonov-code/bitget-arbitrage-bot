@@ -1,11 +1,13 @@
 // src/position_manager.rs
 
+use crate::api_client::ApiClient;
 use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
 use dashmap::DashMap;
 use rust_decimal::{Decimal, prelude::FromStr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -13,6 +15,7 @@ use tracing::{info, warn};
 /// Он слушает события об исполнении ордеров и обновляет состояние позиций.
 pub async fn run_position_manager(
     app_state: Arc<AppState>,
+    api_client: Arc<ApiClient>, // <-- НОВЫЙ АРГУМЕНТ
     mut event_rx: mpsc::Receiver<OrderFilledEvent>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
@@ -31,7 +34,7 @@ pub async fn run_position_manager(
 
                 match filled_event.context {
                     OrderContext::Entry => {
-                        handle_entry_fill(filled_event, &app_state, &pending_entry_orders).await;
+                        handle_entry_fill(filled_event, &app_state, &pending_entry_orders, &api_client).await;
                     },
                     OrderContext::Exit => {
                         handle_exit_fill(filled_event, &app_state, &pending_exit_orders).await;
@@ -52,6 +55,7 @@ async fn handle_entry_fill(
     event: OrderFilledEvent,
     app_state: &Arc<AppState>,
     pending_orders: &DashMap<String, (Option<OrderFilledEvent>, Option<OrderFilledEvent>)>,
+    api_client: &Arc<ApiClient>, // <-- НОВЫЙ АРГУМЕНТ
 ) {
     let mut entry = pending_orders.entry(event.client_oid.clone()).or_default();
     match event.order_type {
@@ -91,6 +95,32 @@ async fn handle_entry_fill(
             cached_spot_balance: Default::default(), // <-- FIX: Initialize the new field
         };
 
+        // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
+        tokio::spawn({
+            let client = api_client.clone();
+            let position_clone = new_position.clone(); // Клонируем позицию для задачи
+            let symbol = new_position.symbol.clone();
+
+            async move {
+                // Небольшая пауза, чтобы дать бирже время на клиринг
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let base_coin = symbol.replace("USDT", "");
+                match client.get_spot_balance(&base_coin).await {
+                    Ok(balance) => {
+                        info!("[BalanceCacher] Successfully fetched and cached balance for {}: {}", symbol, balance);
+                        // Записываем полученный баланс в кэш
+                        let mut cached_balance = position_clone.cached_spot_balance.lock().unwrap();
+                        *cached_balance = Some(balance);
+                    },
+                    Err(e) => {
+                        // Если не удалось получить баланс, кэш останется пустым (None).
+                        // Логика в `handle_open_position` сможет это обработать.
+                        warn!("[BalanceCacher] Failed to fetch initial balance for {}: {:?}", symbol, e);
+                    }
+                }
+            }
+        });
         // Сохраняем в локальном состоянии
         app_state.inner.active_positions.insert(spot_fill.symbol.clone(), new_position);
 

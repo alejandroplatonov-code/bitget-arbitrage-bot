@@ -146,28 +146,19 @@ async fn handle_open_position(
                     let shutdown = shutdown.clone();
  
                     async move {
-                        // --- НОВАЯ ЛОГИКА С КЭШЕМ ---
-
+                        // --- НОВАЯ УПРОЩЕННАЯ ЛОГИКА ---
                         // --- ЭТАП 1: Получаем баланс из КЭША ---
-                        let cached_balance = *position.cached_spot_balance.lock().unwrap();
-
-                        let actual_spot_balance = match cached_balance {
+                        let actual_spot_balance = match *position.cached_spot_balance.lock().unwrap() {
                             Some(balance) => {
-                                info!("[{}] Closing Step 1 SUCCESS: Using cached spot balance of {}.", symbol, balance);
+                                info!("[{}] Closing: Using cached spot balance of {}.", symbol, balance);
                                 balance
                             },
                             None => {
-                                // Если кэш еще пуст (прошло < 5 сек с открытия),
-                                // делаем один запрос "на лету" в качестве фолбэка.
-                                warn!("[{}] Closing Step 1 WARNING: Spot balance cache is empty. Fetching manually...", symbol);
-                                match client.get_spot_balance(&symbol.replace("USDT", "")).await {
-                                    Ok(balance) => balance,
-                                    Err(e) => {
-                                        error!("[{}] Failed to fetch manual balance: {:?}. Aborting close.", symbol, e);
-                                        app_state.inner.executing_pairs.remove(&symbol);
-                                        return;
-                                    }
-                                }
+                                // Если кэш пуст, это значит, что фоновая задача в PositionManager еще не завершилась
+                                // или завершилась с ошибкой. Мы не можем продолжать.
+                                warn!("[Algorithm] Closing SKIPPED for {}: spot balance has not been cached yet. Will retry on next tick.", symbol);
+                                app_state.inner.executing_pairs.remove(&symbol); // Снимаем блокировку, чтобы можно было попробовать снова
+                                return;
                             }
                         };
  
