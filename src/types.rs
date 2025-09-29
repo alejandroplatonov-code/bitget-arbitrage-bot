@@ -10,6 +10,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SymbolRules {
     pub spot_quantity_scale: Option<u32>,
+    pub futures_quantity_scale: Option<u32>,
     pub min_trade_amount: Option<Decimal>, // Порог "пыли" для спота
 }
 

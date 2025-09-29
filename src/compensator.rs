@@ -68,23 +68,22 @@ async fn handle_compensation_task(
         warn!("[Compensator] Attempt #{} to compensate leg for {} (original order ID: {})", attempts, task.symbol, task.original_order_id);
 
         // --- ИСПРАВЛЕНИЕ: Получаем правила округления из AppState ---
-        let rules = app_state.inner.symbol_rules.get(&task.symbol).map(|r| *r.value()).unwrap_or_default();
-        let quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
+        let rules = app_state.inner.symbol_rules.get(&task.symbol)
+            .map(|r| *r.value())
+            .unwrap_or_default();
 
         let result: Result<_, _> = match (task.leg_to_compensate, task.original_direction) {
             // Original was BuySpot, so we need to SellSpot.
             (OrderType::Spot, ArbitrageDirection::BuySpotSellFutures) => {
-                // Используем `quantity_scale` при формировании `PlaceOrderRequest`
-                let qty = task.base_qty_to_compensate.trunc_with_scale(quantity_scale);
+                let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
+                let qty = task.base_qty_to_compensate.trunc_with_scale(spot_quantity_scale);
                 let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: "sell".to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
                 api_client.place_spot_order(req).await.map(|_| ())
             },
             // Original was SellFutures, so we need to BuyFutures.
             (OrderType::Futures, ArbitrageDirection::BuySpotSellFutures) => {
-                // Для фьючерсов обычно используется другое правило, но для компенсации используем то же количество.
-                // Предположим, что для фьючерсов 4 знака - это нормально.
-                const FUTURES_QUANTITY_SCALE: u32 = 4;
-                let qty = task.base_qty_to_compensate.trunc_with_scale(FUTURES_QUANTITY_SCALE);
+                let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4); // Фолбэк на 4
+                let qty = task.base_qty_to_compensate.trunc_with_scale(futures_quantity_scale);
                 let req = PlaceFuturesOrderRequest { symbol: task.symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(), margin_coin: "USDT".to_string(), size: qty.to_string(), side: "buy".to_string(), trade_side: None, order_type: "market".to_string(), client_oid: None };
                 api_client.place_futures_order(req).await.map(|_| ())
             },

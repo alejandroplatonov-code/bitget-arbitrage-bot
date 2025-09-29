@@ -383,13 +383,16 @@ fn check_and_execute_arbitrage( // No longer async
                     // Генерируем уникальный ID для этой пары ордеров
                     let client_oid = uuid::Uuid::new_v4().to_string();
 
-                    // --- НОВАЯ ГЛОБАЛЬНАЯ ЛОГИКА ОКРУГЛЕНИЯ ДЛЯ ФЬЮЧЕРСА ---
-                    const GLOBAL_QUANTITY_SCALE: u32 = 4; // Глобальное правило: 4 знака
+                    // --- ИСПРАВЛЕНИЕ: Используем динамические правила округления ---
+                    let rules = app_state.inner.symbol_rules.get(symbol)
+                        .map(|r| *r.value())
+                        .unwrap_or_default();
+                    let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4); // Фолбэк на 4
 
                     // Для market-sell на фьючерсах `size` - это объем в базовой валюте.
                     // Жестко "отрезаем" все, что идет после 4-го знака.
-                    let rounded_futures_qty = base_qty_n.trunc_with_scale(GLOBAL_QUANTITY_SCALE);
-                    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+                    let rounded_futures_qty = base_qty_n.trunc_with_scale(futures_quantity_scale);
+                    // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
                     info!("[{}] ARBITRAGE OPPORTUNITY DETECTED. Gross Spread: {:.4}%. Base Qty (N): {}. Locking pair for execution...", symbol, spread_percent, rounded_futures_qty);
 

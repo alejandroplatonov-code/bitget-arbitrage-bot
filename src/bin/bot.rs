@@ -35,6 +35,14 @@ struct SpotSymbolInfo {
     min_trade_amount: String,
 }
 
+#[derive(Deserialize, Debug)]
+struct FuturesSymbolInfo {
+    symbol: String,
+    #[serde(rename = "quantityScale", default)]
+    quantity_scale: String,
+    // Нам не нужны другие поля, такие как priceScale, для этой задачи
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 1. Инициализация Логирования ---
@@ -252,7 +260,7 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
                 if !spot_info.quantity_scale.is_empty() { // Only warn if it's not empty but fails to parse
                     missing_scale_symbols.push(spot_info.symbol.clone());
                 }
-                rules.spot_quantity_scale = Some(6); // Fallback
+                rules.spot_quantity_scale = Some(2); // Безопасный фолбэк - 2 знака, как в ТЗ
             }
         }
         if let Ok(min_amount) = Decimal::from_str(&spot_info.min_trade_amount) {
@@ -269,7 +277,20 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
     if futures_rules_data["code"].as_str() != Some("00000") {
         return Err(AppError::LogicError(format!("Failed to fetch futures rules: {}", futures_rules_data["msg"])));
     }
-    // let _futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
+    let futures_symbols: Vec<FuturesSymbolInfo> = serde_json::from_value(futures_rules_data["data"].clone())?;
+
+    let mut missing_futures_scale_symbols = Vec::new();
+    for fut_info in futures_symbols {
+        // Получаем доступ к уже существующей записи (созданной для спота) или создаем новую.
+        let mut rules = app_state.inner.symbol_rules.entry(fut_info.symbol.clone()).or_default();
+        match fut_info.quantity_scale.parse::<u32>() {
+            Ok(s) => rules.futures_quantity_scale = Some(s),
+            Err(_) => {
+                missing_futures_scale_symbols.push(fut_info.symbol.clone());
+                rules.futures_quantity_scale = Some(4); // Безопасный фолбэк для фьючерсов
+            }
+        }
+    }
 
     // --- Verification ---
     let trading_pairs = load_token_list()?;
