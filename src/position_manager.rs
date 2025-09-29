@@ -15,8 +15,8 @@ use tracing::{info, warn};
 /// Он слушает события об исполнении ордеров и обновляет состояние позиций.
 pub async fn run_position_manager(
     app_state: Arc<AppState>,
-    api_client: Arc<ApiClient>, // <-- НОВЫЙ АРГУМЕНТ
     mut event_rx: mpsc::Receiver<OrderFilledEvent>,
+    api_client: Arc<ApiClient>, // <-- НОВЫЙ АРГУМЕНТ
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     info!("[PositionManager] Service started.");
@@ -102,25 +102,34 @@ async fn handle_entry_fill(
             let symbol = new_position.symbol.clone();
 
             async move {
-                // Небольшая пауза, чтобы дать бирже время на клиринг
+                // Пауза перед первым запросом
                 tokio::time::sleep(Duration::from_millis(500)).await;
-
                 let base_coin = symbol.replace("USDT", "");
-                match client.get_spot_balance(&base_coin).await {
-                    Ok(balance) => {
-                        info!("[BalanceCacher] Successfully fetched and cached balance for {}: {}", symbol, balance);
-                        // Записываем полученный баланс в кэш
-                        let mut cached_balance = position_clone.cached_spot_balance.lock().unwrap();
-                        *cached_balance = Some(balance);
-                    },
-                    Err(e) => {
-                        // Если не удалось получить баланс, кэш останется пустым (None).
-                        // Логика в `handle_open_position` сможет это обработать.
-                        warn!("[BalanceCacher] Failed to fetch initial balance for {}: {:?}", symbol, e);
+
+                // Цикл повторных попыток
+                let mut attempts = 0;
+                loop {
+                    attempts += 1;
+                    match client.get_spot_balance(&base_coin).await {
+                        Ok(balance) => {
+                            info!("[BalanceCacher] Successfully fetched and cached balance for {}: {}", symbol, balance);
+                            let mut cached_balance = position_clone.cached_spot_balance.lock().unwrap();
+                            *cached_balance = Some(balance);
+                            break; // Успех, выходим из цикла
+                        },
+                        Err(e) => {
+                            warn!("[BalanceCacher] Attempt #{}: Failed to fetch initial balance for {}: {:?}. Retrying...", attempts, symbol, e);
+                            if attempts >= 5 { // Сдаемся после 5 попыток
+                                error!("[BalanceCacher] CRITICAL: Could not cache balance for {}. It may not close correctly.", symbol);
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             }
         });
+        // --- КОНЕЦ ДОБАВЛЕНИЯ ---
         // Сохраняем в локальном состоянии
         app_state.inner.active_positions.insert(spot_fill.symbol.clone(), new_position);
 

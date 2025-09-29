@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let position_manager_handle = tokio::spawn(run_position_manager(
         app_state.clone(),
-        api_client.clone(),
         order_filled_rx,
+        api_client.clone(),
         shutdown_notify.clone(),
     ));
     info!("[Bot] Position Manager started.");
