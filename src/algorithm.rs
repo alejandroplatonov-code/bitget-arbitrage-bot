@@ -156,7 +156,7 @@ async fn handle_open_position(
                             None => {
                                 // Если кэш пуст, это значит, что фоновая задача в PositionManager еще не завершилась
                                 // или завершилась с ошибкой. Мы не можем продолжать.
-                                warn!("[Algorithm] Closing SKIPPED for {}: spot balance has not been cached yet. Will retry on next tick.", symbol);
+                                warn!("[Algorithm] Closing SKIPPED for {}: spot balance has not been cached yet (PositionManager task may still be running). Will retry on next tick.", symbol);
                                 app_state.inner.executing_pairs.remove(&symbol); // Снимаем блокировку, чтобы можно было попробовать снова
                                 return;
                             }

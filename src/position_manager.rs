@@ -109,7 +109,7 @@ async fn handle_entry_fill(
                 // Цикл повторных попыток
                 let mut attempts = 0;
                 loop {
-                    attempts += 1;
+                    attempts += 1; // Увеличиваем счетчик перед попыткой
                     match client.get_spot_balance(&base_coin).await {
                         Ok(balance) => {
                             info!("[BalanceCacher] Successfully fetched and cached balance for {}: {}", symbol, balance);
@@ -118,12 +118,12 @@ async fn handle_entry_fill(
                             break; // Успех, выходим из цикла
                         },
                         Err(e) => {
-                            warn!("[BalanceCacher] Attempt #{}: Failed to fetch initial balance for {}: {:?}. Retrying...", attempts, symbol, e);
-                            if attempts >= 5 { // Сдаемся после 5 попыток
+                            warn!("[BalanceCacher] Attempt #{}: Failed to fetch initial balance for {}: {:?}. Retrying in 1s...", attempts, symbol, e);
+                            if attempts >= 5 { // Сдаемся после 5 попыток, чтобы не зацикливаться вечно
                                 error!("[BalanceCacher] CRITICAL: Could not cache balance for {}. It may not close correctly.", symbol);
                                 break;
                             }
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await; // Пауза перед следующей попыткой
                         }
                     }
                 }
