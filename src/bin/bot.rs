@@ -2,6 +2,7 @@
 
 use rust_template_for_testing::{
     algorithm::run_trading_algorithm,
+    balance_updater::run_balance_updater, // <-- Добавьте импорт
     api_client::ApiClient,
     compensator::run_compensator,
     config::{load_token_list, Config},
@@ -153,6 +154,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
     info!("[Bot] Position Manager started.");
 
+    let balance_updater_handle = tokio::spawn(run_balance_updater(
+        app_state.clone(),
+        api_client.clone(),
+        shutdown_notify.clone(),
+    ));
+    info!("[Bot] Balance Updater started.");
+
     let compensator_handle = tokio::spawn(run_compensator(
         compensation_rx,
         api_client.clone(),
@@ -195,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut order_watcher_handle = order_watcher_handle;
     let mut position_manager_handle = position_manager_handle;
     let mut cmd_listener_handle = cmd_listener_handle;
+    let mut balance_updater_handle = balance_updater_handle;
     let mut compensator_handle = compensator_handle;
     let mut redis_dispatcher_handle = redis_dispatcher_handle;
 
@@ -204,6 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         res = &mut algorithm_handle => warn!("[Bot] Trading algorithm task finished unexpectedly: {:?}", res),
         res = &mut order_watcher_handle => warn!("[Bot] Order watcher task finished unexpectedly: {:?}", res),
         res = &mut position_manager_handle => warn!("[Bot] Position manager task finished unexpectedly: {:?}", res),
+        res = &mut balance_updater_handle => warn!("[Bot] Balance updater task finished unexpectedly: {:?}", res),
         res = &mut cmd_listener_handle => warn!("[Bot] Command listener task finished unexpectedly: {:?}", res),
         res = &mut compensator_handle => warn!("[Bot] Compensator task finished unexpectedly: {:?}", res),
         res = &mut redis_dispatcher_handle => warn!("[Bot] Redis event dispatcher task finished unexpectedly: {:?}", res),
@@ -216,15 +226,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown_timeout = Duration::from_secs(10);
     let graceful_shutdown = async {
         info!("[Bot] Waiting for tasks to finish...");
-        let (spot, fut, algo, watch, pos, cmd, comp, redis) = tokio::join!(
+        let (spot, fut, algo, watch, pos, balance, cmd, comp, redis) = tokio::join!(
             spot_handle, futures_handle, algorithm_handle, order_watcher_handle,
-            position_manager_handle, cmd_listener_handle, compensator_handle, redis_dispatcher_handle
+            position_manager_handle, balance_updater_handle, cmd_listener_handle, compensator_handle, redis_dispatcher_handle
         );
         info!("[Bot] Spot Connector finished: {:?}", spot);
         info!("[Bot] Futures Connector finished: {:?}", fut);
         info!("[Bot] Algorithm finished: {:?}", algo);
         info!("[Bot] Order Watcher finished: {:?}", watch);
         info!("[Bot] Position Manager finished: {:?}", pos);
+        info!("[Bot] Balance Updater finished: {:?}", balance);
         info!("[Bot] Command Listener finished: {:?}", cmd);
         info!("[Bot] Compensator finished: {:?}", comp);
         info!("[Bot] Redis Dispatcher finished: {:?}", redis);

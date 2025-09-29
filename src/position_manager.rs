@@ -88,6 +88,7 @@ async fn handle_entry_fill(
             futures_entry_vwap: futures_price,
             current_state: Default::default(),
             entry_spread_percent,
+            cached_spot_balance: Default::default(), // <-- FIX: Initialize the new field
         };
 
         // Сохраняем в локальном состоянии

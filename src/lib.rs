@@ -1,6 +1,7 @@
 // src/lib.rs
 
 pub mod algorithm;
+pub mod balance_updater;
 pub mod api_client; // Already public
 pub mod compensator;
 pub mod config;

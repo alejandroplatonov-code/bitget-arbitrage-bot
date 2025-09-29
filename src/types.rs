@@ -94,6 +94,11 @@ pub struct ActivePosition {
 
     // НОВОЕ ПОЛЕ
     pub entry_spread_percent: Decimal,
+
+    // --- НОВОЕ ПОЛЕ ---
+    // Хранит последний известный фактический баланс, обновляемый фоновой задачей.
+    #[serde(skip, default = "default_cached_balance")]
+    pub cached_spot_balance: Arc<Mutex<Option<Decimal>>>,
 }
 
 /// Represents a trade that has been closed.
@@ -139,6 +144,11 @@ pub enum TradeEvent {
 /// Helper function to provide a default value for the skipped field.
 fn default_position_state() -> Arc<Mutex<PositionState>> {
     Arc::new(Mutex::new(PositionState::default()))
+}
+
+/// Helper function to provide a default value for the skipped field.
+fn default_cached_balance() -> Arc<Mutex<Option<Decimal>>> {
+    Arc::new(Mutex::new(None))
 }
 
 /// Represents a command received via the Redis channel.
