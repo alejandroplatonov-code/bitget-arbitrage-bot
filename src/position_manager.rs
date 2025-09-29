@@ -5,7 +5,7 @@ use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
 use dashmap::DashMap;
-use rust_decimal::{Decimal, prelude::FromStr};
+use rust_decimal::{dec, Decimal, prelude::FromStr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -55,7 +55,7 @@ async fn handle_entry_fill(
     event: OrderFilledEvent,
     app_state: &Arc<AppState>,
     pending_orders: &DashMap<String, (Option<OrderFilledEvent>, Option<OrderFilledEvent>)>,
-    api_client: &Arc<ApiClient>, // <-- НОВЫЙ АРГУМЕНТ
+    api_client: &Arc<ApiClient>,
 ) {
     let mut entry = pending_orders.entry(event.client_oid.clone()).or_default();
     match event.order_type {
@@ -98,34 +98,50 @@ async fn handle_entry_fill(
         // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
         tokio::spawn({
             let client = api_client.clone();
-            let position_clone = new_position.clone(); // Клонируем позицию для задачи
+            let position_clone = new_position.clone();
             let symbol = new_position.symbol.clone();
+            let app_state = app_state.clone(); // Клонируем AppState для доступа к ценам
 
             async move {
-                // Пауза перед первым запросом
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let base_coin = symbol.replace("USDT", "");
+                const DUST_THRESHOLD_USDT: Decimal = dec!(4);
+                const MAX_ATTEMPTS: usize = 10;
 
-                // Цикл повторных попыток
                 let mut attempts = 0;
                 loop {
-                    attempts += 1; // Увеличиваем счетчик перед попыткой
+                    if attempts >= MAX_ATTEMPTS {
+                        error!("[BalanceCacher] CRITICAL: Could not cache a valid (non-dust) balance for {} after {} attempts. It may not close correctly.", symbol, MAX_ATTEMPTS);
+                        break;
+                    }
+                    attempts += 1;
+
                     match client.get_spot_balance(&base_coin).await {
                         Ok(balance) => {
-                            info!("[BalanceCacher] Successfully fetched and cached balance for {}: {}", symbol, balance);
-                            let mut cached_balance = position_clone.cached_spot_balance.lock().unwrap();
-                            *cached_balance = Some(balance);
-                            break; // Успех, выходим из цикла
+                            // Проверяем, не является ли баланс "пылью"
+                            let spot_price = app_state.inner.market_data.get(&symbol)
+                                .and_then(|p| p.value().spot_last_price)
+                                .unwrap_or(Decimal::ONE); // Если цены нет, считаем 1:1 для безопасности
+
+                            let balance_in_usdt = balance * spot_price;
+
+                            if balance_in_usdt >= DUST_THRESHOLD_USDT {
+                                info!("[BalanceCacher] Attempt #{}: Successfully fetched and cached valid balance for {}: {} (Value: {:.2} USDT)", attempts, symbol, balance, balance_in_usdt);
+                                let mut cached_balance = position_clone.cached_spot_balance.lock().unwrap();
+                                *cached_balance = Some(balance);
+                                break; // Успех, баланс валидный, выходим.
+                            } else {
+                                warn!("[BalanceCacher] Attempt #{}: Fetched balance for {} is considered dust: {} (Value: {:.2} USDT). Retrying...", attempts, symbol, balance, balance_in_usdt);
+                                // Не выходим, продолжаем цикл
+                            }
                         },
                         Err(e) => {
-                            warn!("[BalanceCacher] Attempt #{}: Failed to fetch initial balance for {}: {:?}. Retrying in 1s...", attempts, symbol, e);
-                            if attempts >= 5 { // Сдаемся после 5 попыток, чтобы не зацикливаться вечно
-                                error!("[BalanceCacher] CRITICAL: Could not cache balance for {}. It may not close correctly.", symbol);
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_secs(1)).await; // Пауза перед следующей попыткой
+                            warn!("[BalanceCacher] Attempt #{}: API error fetching balance for {}: {:?}. Retrying...", attempts, symbol, e);
+                            // Не выходим, продолжаем цикл
                         }
                     }
+                    // Пауза перед следующей попыткой (и в случае пыли, и в случае ошибки API)
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         });

@@ -148,14 +148,14 @@ async fn handle_open_position(
                     async move {
                         // --- НОВАЯ УПРОЩЕННАЯ ЛОГИКА ---
                         // --- ЭТАП 1: Получаем баланс из КЭША ---
+                        // Теперь мы уверены, что если баланс есть, он "не пылевой",
+                        // так как position_manager выполняет эту проверку.
                         let actual_spot_balance = match *position.cached_spot_balance.lock().unwrap() {
                             Some(balance) => {
                                 info!("[{}] Closing: Using cached spot balance of {}.", symbol, balance);
                                 balance
                             },
                             None => {
-                                // Если кэш пуст, это значит, что фоновая задача в PositionManager еще не завершилась
-                                // или завершилась с ошибкой. Мы не можем продолжать.
                                 warn!("[Algorithm] Closing SKIPPED for {}: spot balance has not been cached yet (PositionManager task may still be running). Will retry on next tick.", symbol);
                                 app_state.inner.executing_pairs.remove(&symbol); // Снимаем блокировку, чтобы можно было попробовать снова
                                 return;
