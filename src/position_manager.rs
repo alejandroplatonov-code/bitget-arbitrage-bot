@@ -9,7 +9,7 @@ use rust_decimal::{Decimal, prelude::FromStr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Основная функция, запускающая менеджер позиций.
 /// Он слушает события об исполнении ордеров и обновляет состояние позиций.
