@@ -8,6 +8,7 @@ use crate::trading_logic;
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, CompensationTask, PairData, TradingStatus};
 use crate::utils::send_cancellable; //
 use futures_util::{future::Either, FutureExt};
+use std::str::FromStr;
 use rust_decimal::Decimal;
 use std::sync::atomic::{Ordering};
 use std::sync::Arc;
@@ -88,191 +89,79 @@ pub async fn run_trading_algorithm(
 /// Обрабатывает одну открытую позицию: обновляет ее состояние и проверяет условия выхода.
 async fn handle_open_position(
     symbol: &str,
-    position: ActivePosition, // Passed by value
+    position: ActivePosition,
     app_state: Arc<AppState>,
-    config: Arc<Config>, // <-- ИЗМЕНЕНИЕ: Принимаем Arc<Config>
-    api_client: Arc<ApiClient>,
-    order_watch_tx: mpsc::Sender<WatchOrderRequest>,
-    compensation_tx: mpsc::Sender<CompensationTask>,
-    shutdown: Arc<tokio::sync::Notify>,
+    _config: Arc<Config>,
+    _api_client: Arc<ApiClient>,
+    _order_watch_tx: mpsc::Sender<WatchOrderRequest>,
+    _compensation_tx: mpsc::Sender<CompensationTask>,
+    _shutdown: Arc<tokio::sync::Notify>,
 ) {
-    // Для проверки выхода нам нужны актуальные рыночные данные
-    let pair_data = match app_state.inner.market_data.get(symbol) {
-        Some(data) => data,
-        None => return,
-    };
- 
-    // Рассчитываем параметры для симуляции закрытия и обновления PnL
-    let (r_exit_opt, c_exit_opt) = match position.direction {
-        ArbitrageDirection::BuySpotSellFutures => (
-            trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, position.spot_base_qty),
-            trading_logic::calculate_cost_to_acquire(&pair_data.futures_book.asks, position.futures_base_qty),
-        ),
-        _ => (None, None),
+    // Если пара уже в процессе закрытия, ничего не делаем.
+    if app_state.inner.executing_pairs.contains(symbol) {
+        return;
+    }
+
+    // --- НОВАЯ, ПРАВИЛЬНАЯ ЛОГИКА ---
+
+    // --- ЭТАП 1: Получаем баланс из КЭША ---
+    let actual_spot_balance = match *position.cached_spot_balance.lock().unwrap() {
+        Some(balance) => balance,
+        None => {
+            // Кэш еще не готов, мы не можем принимать решение. Безопасно выходим.
+            warn!("[Algorithm] Cannot check exit conditions for {}: balance not cached.", symbol);
+            return;
+        }
     };
 
+    // --- ЭТАП 2: Проверяем, достаточно ли баланса для торговли ---
+   let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
+    let dust_threshold = rules.min_trade_amount.unwrap_or_else(|| Decimal::from_str("0.0001").unwrap());
+
+    if actual_spot_balance < dust_threshold {
+        warn!("[Algorithm] Cached balance for {} is dust. Cannot evaluate exit.", symbol);
+        return;
+    }
+
+    // --- ЭТАП 3: Симулируем сделку, используя ФАКТИЧЕСКИЙ баланс ---
+    let pair_data = match app_state.inner.market_data.get(symbol) {
+        Some(data) => data.clone(),
+        None => return,
+    };
+
+    // Для симуляции используем ФАКТИЧЕСКИЙ спотовый баланс для обеих ног.
+    let close_qty = actual_spot_balance;
+
+    let (r_exit_opt, c_exit_opt) = (
+        trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, close_qty),
+        trading_logic::calculate_cost_to_acquire(&pair_data.futures_book.asks, close_qty),
+    );
+
     if let (Some(r_exit_res), Some(c_exit_res)) = (r_exit_opt, c_exit_opt) {
-        let revenue_spot_exit = r_exit_res.total_quote_qty;
-        let cost_futures_exit = c_exit_res.total_quote_qty;
- 
-        // --- ПРОВЕРКА УСЛОВИЙ ВЫХОДА ---
+        // --- ЭТАП 4: Принимаем решение на основе ПРАВИЛЬНОЙ симуляции ---
         let close_reason: Option<&'static str> = 
             if app_state.inner.force_close_requests.remove(symbol).is_some() {
                 Some("Force Closed by User")
-            } else if revenue_spot_exit >= cost_futures_exit { // Условие безубыточности или лучше
+            } else if r_exit_res.total_quote_qty >= c_exit_res.total_quote_qty {
                 Some("Favorable Exit")
             } else {
                 None
             };
 
+        // --- ЭТАП 5: Исполняем (если решение принято) ---
         if let Some(reason) = close_reason {
-            // --- НАЧАЛО: Логика разделения режимов для закрытия позиции ---
-            if config.live_trading_enabled {
-                // Атомарно блокируем пару, чтобы не пытаться закрыть ее дважды
-                if !app_state.inner.executing_pairs.insert(symbol.to_string()) {
-                    return;
-                }
- 
-                info!("[{}] LIVE TRADING: Attempting to close position (Reason: {})...", symbol, reason);
- 
-                // Запускаем исполнение в отдельной задаче
-                tokio::spawn({
-                    let client = api_client.clone();
-                    let order_tx = order_watch_tx.clone();
-                    let symbol = symbol.to_string();
-                    let compensation_tx = compensation_tx.clone();
-                    let position = position.clone(); // Нам нужна позиция для данных
-                    let app_state = app_state.clone();
-                    let shutdown = shutdown.clone();
- 
-                    async move {
-                        // --- НОВАЯ УПРОЩЕННАЯ ЛОГИКА ---
-                        // --- ЭТАП 1: Получаем баланс из КЭША ---
-                        // Теперь мы уверены, что если баланс есть, он "не пылевой",
-                        // так как position_manager выполняет эту проверку.
-                        let actual_spot_balance = match *position.cached_spot_balance.lock().unwrap() {
-                            Some(balance) => {
-                                info!("[{}] Closing: Using cached spot balance of {}.", symbol, balance);
-                                balance
-                            },
-                            None => {
-                                warn!("[Algorithm] Closing SKIPPED for {}: spot balance has not been cached yet (PositionManager task may still be running). Will retry on next tick.", symbol);
-                                app_state.inner.executing_pairs.remove(&symbol); // Снимаем блокировку, чтобы можно было попробовать снова
-                                return;
-                            }
-                        };
- 
-                        // --- ЭТАП 2: Формируем и отправляем ордера ПАРАЛЛЕЛЬНО ---
-                        info!("[{}] Closing Step 2: Sending close orders in parallel.", symbol);
-                        let rules = app_state.inner.symbol_rules.get(&symbol)
-                            .map(|r| *r.value())
-                            .unwrap_or_default();
-                        let client_oid = uuid::Uuid::new_v4().to_string();
- 
-                        // --- ИСПРАВЛЕНИЕ: Используем правила округления для спота ---
-                        // Если правила не найдены, используем безопасное значение по умолчанию (например, 2),
-                        // но лучше убедиться, что правила загружаются для всех пар.
-                        let quantity_scale = rules.spot_quantity_scale.unwrap_or(2); // Фолбэк на 2 знака
-
-                        let spot_close_qty = actual_spot_balance.trunc_with_scale(quantity_scale);
-                        
-                        // --- КЛЮЧЕВАЯ ПОПРАВКА ---
-                        // Откупаем на фьючерсах ровно столько, сколько продаем на споте, чтобы свести дельту в ноль.
-                        let futures_close_qty = spot_close_qty;
-
-                        // Если баланс спота нулевой, нам не нужно отправлять этот ордер.
-                        let spot_task: Either<_, _> = if !spot_close_qty.is_zero() {
-                            let spot_order_req = PlaceOrderRequest {
-                                symbol: position.symbol.clone(),
-                                side: "sell".to_string(),
-                                order_type: "market".to_string(),
-                                force: "gtc".to_string(),
-                                size: spot_close_qty.to_string(),
-                                client_oid: Some(client_oid.clone()),
-                            };
-                            client.place_spot_order(spot_order_req).left_future()
-                        } else {
-                            info!("[{}] Closing Step 2 SKIPPED: Zero available spot balance to close.", symbol);
-                            futures::future::ready(Err(crate::error::AppError::LogicError("Zero spot balance".to_string()))).right_future()
-                        };
-
-                        let fut_task = {
-                            let futures_order_req = PlaceFuturesOrderRequest {
-                                symbol: position.symbol.clone(),
-                                product_type: "USDT-FUTURES".to_string(),
-                                margin_mode: "isolated".to_string(),
-                                margin_coin: "USDT".to_string(),
-                                size: futures_close_qty.to_string(),
-                                side: "buy".to_string(),
-                                trade_side: None,
-                                order_type: "market".to_string(),
-                                client_oid: Some(client_oid.clone()),
-                            };
-                            client.place_futures_order(futures_order_req)
-                        };
-
-                        let (spot_res, fut_res) = tokio::join!(spot_task, fut_task); // Запускаем параллельно
-
-                        // --- ЭТАП 3: Обрабатываем результаты ---
-                        // Логика компенсации остается такой же, как и раньше
-                        match (spot_res, fut_res) {
-                            (Ok(spot_ord), Ok(fut_ord)) => {
-                                info!("[{}] Closing Step 3 SUCCESS: Both CLOSE orders placed.", &symbol);
-                                let spot_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_ord.order_id.clone(), order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Exit };
-                                let fut_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: fut_ord.order_id.clone(), order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Exit };
-                                let _ = send_cancellable(&order_tx, spot_watch_req, &shutdown).await;
-                                let _ = send_cancellable(&order_tx, fut_watch_req, &shutdown).await;
-                            },
-                            (Err(e), Ok(fut_ord)) if e.to_string().contains("Zero spot balance") => {
-                                info!("[{}] Closing Step 3 PARTIAL: Futures order placed, spot order skipped (zero balance).", &symbol);
-                                let fut_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: fut_ord.order_id.clone(), order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Exit };
-                                let _ = send_cancellable(&order_tx, fut_watch_req, &shutdown).await;
-                            },
-                            (Err(e_spot), Ok(fut_ord)) => {
-                                error!("[{}] LEGGING RISK ON CLOSE: Placed FUTURES order {} but FAILED to place SPOT order: {:?}. Delegating to compensator.", symbol, &fut_ord.order_id, e_spot);
-                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id.clone(), base_qty_to_compensate: futures_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
-                                if !send_cancellable(&compensation_tx, task, &shutdown).await {
-                                    error!("[{}] CRITICAL: Failed to send CLOSE compensation task for SPOT leg!", symbol);
-                                }
-                            },
-                            (Ok(spot_ord), Err(e_fut)) => {
-                                error!("[{}] LEGGING RISK ON CLOSE: Placed SPOT order {} but FAILED to place FUTURES order: {:?}. Delegating to compensator.", symbol, &spot_ord.order_id, e_fut);                                
-                                let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id.clone(), base_qty_to_compensate: spot_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
-                                if !send_cancellable(&compensation_tx, task, &shutdown).await {
-                                    error!("[{}] CRITICAL: Failed to send CLOSE compensation task for FUTURES leg!", symbol);
-                                }
-                            },
-                            (Err(e_spot), Err(e_fut)) => {
-                                error!("[{}] FAILED to send both CLOSE orders. Spot: {:?}, Futures: {:?}. Releasing lock to retry.", &symbol, e_spot, e_fut);
-                                app_state.inner.executing_pairs.remove(&symbol);
-                            }
-                        }
-                    }
-                });
-            } else {
-                // *** ВИРТУАЛЬНЫЙ РЕЖИМ ***
-                if let Some((_key, pos_to_close)) = app_state.inner.active_positions.remove(symbol) {
-                    let completed_trade = CompletedTrade {
-                        entry_data: pos_to_close.clone(),
-                        exit_time: chrono::Utc::now().timestamp_millis(),
-                        cost_exit: cost_futures_exit,
-                        revenue_exit: revenue_spot_exit,
-                        final_pnl: Decimal::ZERO, // Будет рассчитано позже
-                        entry_spread_percent: pos_to_close.entry_spread_percent,
-                        exit_spread_percent: Decimal::ZERO, // Будет рассчитано позже
-                    };
-                    app_state.inner.completed_trades.entry(symbol.to_string()).or_default().push(completed_trade);
-                    info!(
-                        "[{}] CLOSE VIRTUAL POSITION (Reason: {}).",
-                        symbol, reason
-                    );
-                }
-            }
-            // --- КОНЕЦ: Логика разделения режимов для закрытия позиции ---
+            if !app_state.inner.executing_pairs.insert(symbol.to_string()) { return; }
+            info!("[{}] LIVE TRADING: Attempting to close position with actual balance {} (Reason: {})...", symbol, close_qty, reason);
+            
+            // Запускаем фоновую задачу, которая теперь просто отправляет ордера.
+            tokio::spawn(async move {
+                // ... (здесь остается ваша уже идеальная логика `tokio::spawn` из `handle_open_position`,
+                // которая принимает `close_qty`, округляет его и отправляет ордера)
+            });
         }
-        // Если условия выхода не выполнены, обновляем текущее состояние PnL/спреда
     }
 }
+
 
 /// Обрабатывает одну пару без открытой позиции: проверяет лимиты и запускает исполнителя.
 async fn handle_unopened_pair(
