@@ -29,6 +29,7 @@ pub struct Config {
 
     // НОВОЕ ПОЛЕ
     pub max_active_positions: usize,
+    pub dust_threshold_usdt: Decimal,
 
     // NEW FIELD
     #[serde(skip)] // This field is not from config.toml

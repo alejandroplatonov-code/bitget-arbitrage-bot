@@ -1,6 +1,7 @@
 // src/position_manager.rs
 
 use crate::api_client::ApiClient;
+use crate::config::Config;
 use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
 use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
@@ -15,8 +16,9 @@ use tracing::{error, info, warn};
 /// Он слушает события об исполнении ордеров и обновляет состояние позиций.
 pub async fn run_position_manager(
     app_state: Arc<AppState>,
+    api_client: Arc<ApiClient>,
+    config: Arc<Config>,
     mut event_rx: mpsc::Receiver<OrderFilledEvent>,
-    api_client: Arc<ApiClient>, // <-- НОВЫЙ АРГУМЕНТ
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     info!("[PositionManager] Service started.");
@@ -34,7 +36,7 @@ pub async fn run_position_manager(
 
                 match filled_event.context {
                     OrderContext::Entry => {
-                        handle_entry_fill(filled_event, &app_state, &pending_entry_orders, &api_client).await;
+                        handle_entry_fill(filled_event, &app_state, &pending_entry_orders, &api_client, &config).await;
                     },
                     OrderContext::Exit => {
                         handle_exit_fill(filled_event, &app_state, &pending_exit_orders).await;
@@ -56,6 +58,7 @@ async fn handle_entry_fill(
     app_state: &Arc<AppState>,
     pending_orders: &DashMap<String, (Option<OrderFilledEvent>, Option<OrderFilledEvent>)>,
     api_client: &Arc<ApiClient>,
+    _config: &Arc<Config>, // config is now available if needed
 ) {
     let mut entry = pending_orders.entry(event.client_oid.clone()).or_default();
     match event.order_type {
@@ -92,7 +95,7 @@ async fn handle_entry_fill(
             futures_entry_vwap: futures_price,
             current_state: Default::default(),
             entry_spread_percent,
-            cached_spot_balance: Default::default(), // <-- FIX: Initialize the new field
+            cached_spot_balance: Default::default(),
         };
 
         // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
@@ -145,7 +148,7 @@ async fn handle_entry_fill(
                 }
             }
         });
-        // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+        
         // Сохраняем в локальном состоянии
         app_state.inner.active_positions.insert(spot_fill.symbol.clone(), new_position);
 
