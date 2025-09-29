@@ -260,7 +260,7 @@ async fn fetch_and_store_symbol_rules(app_state: Arc<AppState>) -> Result<(), Ap
             }
     }
     if !missing_scale_symbols.is_empty() {
-        warn!("[RulesLoader] {} spot symbols are missing 'quantityScale' and will use a fallback scale of 6. Examples: {:?}", missing_scale_symbols.len(), &missing_scale_symbols[..5.min(missing_scale_symbols.len())]);
+        warn!("[RulesLoader] {} spot symbols have unparsable 'quantityScale' and will use a fallback scale of 2. Examples: {:?}", missing_scale_symbols.len(), &missing_scale_symbols[..5.min(missing_scale_symbols.len())]);
     }
 
     // --- Fetch Futures Rules ---

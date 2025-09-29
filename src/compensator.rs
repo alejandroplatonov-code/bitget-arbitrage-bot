@@ -68,16 +68,14 @@ async fn handle_compensation_task(
         warn!("[Compensator] Attempt #{} to compensate leg for {} (original order ID: {})", attempts, task.symbol, task.original_order_id);
 
         // --- ИСПРАВЛЕНИЕ: Получаем правила округления из AppState ---
-        let rules = app_state.inner.symbol_rules.get(&task.symbol)
-            .map(|r| *r.value())
-            .unwrap_or_default();
+        let rules = app_state.inner.symbol_rules.get(&task.symbol).map(|r| *r.value()).unwrap_or_default();
+        let quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
 
         let result: Result<_, _> = match (task.leg_to_compensate, task.original_direction) {
             // Original was BuySpot, so we need to SellSpot.
             (OrderType::Spot, ArbitrageDirection::BuySpotSellFutures) => {
-                // Используем правило для спота, с фолбэком на 2
-                let scale = rules.spot_quantity_scale.unwrap_or(2);
-                let qty = task.base_qty_to_compensate.trunc_with_scale(scale);
+                // Используем `quantity_scale` при формировании `PlaceOrderRequest`
+                let qty = task.base_qty_to_compensate.trunc_with_scale(quantity_scale);
                 let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: "sell".to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
                 api_client.place_spot_order(req).await.map(|_| ())
             },

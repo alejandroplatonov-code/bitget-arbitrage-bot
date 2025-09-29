@@ -197,9 +197,9 @@ async fn handle_open_position(
                         // --- ИСПРАВЛЕНИЕ: Используем правила округления для спота ---
                         // Если правила не найдены, используем безопасное значение по умолчанию (например, 2),
                         // но лучше убедиться, что правила загружаются для всех пар.
-                        let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
+                        let quantity_scale = rules.spot_quantity_scale.unwrap_or(2); // Фолбэк на 2 знака
 
-                        let spot_close_qty = actual_spot_balance.trunc_with_scale(spot_quantity_scale);
+                        let spot_close_qty = actual_spot_balance.trunc_with_scale(quantity_scale);
                         
                         // --- КЛЮЧЕВАЯ ПОПРАВКА ---
                         // Откупаем на фьючерсах ровно столько, сколько продаем на споте, чтобы свести дельту в ноль.

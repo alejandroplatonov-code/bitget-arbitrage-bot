@@ -16,3 +16,6 @@ Cargo.lock
 
 # Директория с логами
 /logs
+
+/markdown
+config.toml
