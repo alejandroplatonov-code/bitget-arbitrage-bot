@@ -139,6 +139,8 @@ pub struct CompensationTask {
     pub original_direction: ArbitrageDirection,
     /// Which leg of the trade was successfully executed and now needs compensation.
     pub leg_to_compensate: OrderType,
+    /// Was this a compensation for an entry or an exit?
+    pub is_entry: bool,
 }
 
 /// Событие, которое PositionManager публикует для внешних слушателей (например, монитора).

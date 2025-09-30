@@ -73,18 +73,31 @@ async fn handle_compensation_task(
             .unwrap_or_default();
 
         let result: Result<_, _> = match (task.leg_to_compensate, task.original_direction) {
-            // Original was BuySpot, so we need to SellSpot.
+            // --- СЦЕНАРИИ КОМПЕНСАЦИИ ДЛЯ ВХОДА (is_entry = true) ---
+            // Original was BuySpot, so we need to SellSpot to compensate.
             (OrderType::Spot, ArbitrageDirection::BuySpotSellFutures) => {
                 let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
                 let qty = task.base_qty_to_compensate.trunc_with_scale(spot_quantity_scale);
-                let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: "sell".to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
+                let side = if task.is_entry { "sell" } else { "buy" }; // Если компенсируем выход, то покупаем спот
+                let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: side.to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
                 api_client.place_spot_order(req).await.map(|_| ())
             },
-            // Original was SellFutures, so we need to BuyFutures.
+            // Original was SellFutures, so we need to BuyFutures to compensate.
             (OrderType::Futures, ArbitrageDirection::BuySpotSellFutures) => {
                 let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4); // Фолбэк на 4
                 let qty = task.base_qty_to_compensate.trunc_with_scale(futures_quantity_scale);
-                let req = PlaceFuturesOrderRequest { symbol: task.symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(), margin_coin: "USDT".to_string(), size: qty.to_string(), side: "buy".to_string(), trade_side: None, order_type: "market".to_string(), client_oid: None };
+                let side = if task.is_entry { "buy" } else { "sell" }; // Если компенсируем выход, то продаем фьючерс
+                let req = PlaceFuturesOrderRequest {
+                    symbol: task.symbol.clone(),
+                    product_type: "USDT-FUTURES".to_string(),
+                    margin_mode: "isolated".to_string(),
+                    margin_coin: "USDT".to_string(),
+                    size: qty.to_string(),
+                    side: side.to_string(),
+                    trade_side: None,
+                    order_type: "market".to_string(),
+                    client_oid: None
+                };
                 api_client.place_futures_order(req).await.map(|_| ())
             },
             _ => Err(crate::error::AppError::LogicError("Unsupported compensation scenario".to_string())),

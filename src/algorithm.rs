@@ -137,10 +137,10 @@ async fn handle_open_position(
             info!("[{}] EXIT TRIGGERED. Reason: {}. Actual spot balance: {}. Sim Exit Revenue: {:.4}, Sim Exit Cost: {:.4}", // Corrected log format
                 symbol, reason, actual_spot_balance, r_exit_res.total_quote_qty, c_exit_res.total_quote_qty);
 
-            // Spawn a background task to execute the closing orders.
+            // --- ЗАПОЛНЯЕМ ЭТОТ БЛОК ---
             tokio::spawn({
                 // Клонируем все необходимые переменные из внешней области видимости
-                let client = api_client.clone();
+                let client = api_client.clone(); // Используем переменные с `_` из сигнатуры
                 let order_tx = order_watch_tx.clone();
                 let symbol = symbol.to_string();
                 let compensation_tx = compensation_tx.clone();
@@ -153,32 +153,32 @@ async fn handle_open_position(
                         .map(|r| *r.value())
                         .unwrap_or_default();
                     let client_oid = uuid::Uuid::new_v4().to_string();
-
+            
                     let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
                     let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4);
-
+            
                     let spot_close_qty = final_close_qty.trunc_with_scale(spot_quantity_scale);
                     let futures_close_qty = final_close_qty.trunc_with_scale(futures_quantity_scale);
-
+            
                     let spot_task = {
                         let req = PlaceOrderRequest {
                             symbol: symbol.clone(),
                             side: "sell".to_string(),
                             order_type: "market".to_string(),
                             force: "gtc".to_string(),
-                            size: spot_close_qty.to_string(),
+                            size: spot_close_qty.to_string(), // Quantity in base currency for market sell
                             client_oid: Some(client_oid.clone()),
                         };
                         client.place_spot_order(req)
                     };
-
+            
                     let fut_task = {
                         let req = PlaceFuturesOrderRequest {
                             symbol: symbol.clone(),
                             product_type: "USDT-FUTURES".to_string(),
                             margin_mode: "isolated".to_string(),
                             margin_coin: "USDT".to_string(),
-                            size: futures_close_qty.to_string(),
+                            size: futures_close_qty.to_string(), // Quantity in base asset
                             side: "buy".to_string(),
                             trade_side: None,
                             order_type: "market".to_string(),
@@ -186,25 +186,25 @@ async fn handle_open_position(
                         };
                         client.place_futures_order(req)
                     };
-
+            
                     let (spot_res, fut_res) = tokio::join!(spot_task, fut_task);
-
+            
                     match (spot_res, fut_res) {
                         (Ok(spot_ord), Ok(fut_ord)) => {
                             info!("[{}] CLOSE SUCCESS: Both close orders placed. Spot ID: {}, Futures ID: {}", &symbol, spot_ord.order_id, fut_ord.order_id);
-                            let spot_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_ord.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Exit };
-                            let fut_req = WatchOrderRequest { symbol: symbol.clone(), order_id: fut_ord.order_id, order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Exit };
-                            let _ = send_cancellable(&order_tx, spot_req, &shutdown).await;
-                            let _ = send_cancellable(&order_tx, fut_req, &shutdown).await;
+                            let spot_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_ord.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Exit };
+                            let fut_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: fut_ord.order_id, order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Exit };
+                            if !send_cancellable(&order_tx, spot_watch_req, &shutdown).await { error!("[{}] CRITICAL: Failed to send SPOT CLOSE watch request!", symbol); }
+                            if !send_cancellable(&order_tx, fut_watch_req, &shutdown).await { error!("[{}] CRITICAL: Failed to send FUTURES CLOSE watch request!", symbol); }
                         },
                         (Err(e_spot), Ok(fut_ord)) => {
                             error!("[{}] LEGGING RISK ON CLOSE (Spot Failed): {:?}. Delegating to compensator.", symbol, e_spot);
-                            let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id, base_qty_to_compensate: futures_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot };
+                            let task = CompensationTask { symbol: symbol.clone(), original_order_id: fut_ord.order_id, base_qty_to_compensate: futures_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot, is_entry: false };
                             if !send_cancellable(&compensation_tx, task, &shutdown).await { error!("[{}] CRITICAL: Failed to send CLOSE compensation task for SPOT leg!", symbol); }
                         },
                         (Ok(spot_ord), Err(e_fut)) => {
                             error!("[{}] LEGGING RISK ON CLOSE (Futures Failed): {:?}. Delegating to compensator.", symbol, e_fut);
-                            let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id, base_qty_to_compensate: spot_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures };
+                            let task = CompensationTask { symbol: symbol.clone(), original_order_id: spot_ord.order_id, base_qty_to_compensate: spot_close_qty, original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures, is_entry: false };
                             if !send_cancellable(&compensation_tx, task, &shutdown).await { error!("[{}] CRITICAL: Failed to send CLOSE compensation task for FUTURES leg!", symbol); }
                         },
                         (Err(e_spot), Err(e_fut)) => {
@@ -217,7 +217,6 @@ async fn handle_open_position(
         }
     }
 }
-
 /// Handles a pair with no open position: checks limits and spawns an execution task if profitable.
 async fn handle_unopened_pair(
     symbol: String,
@@ -351,9 +350,10 @@ async fn execute_entry_trade_task(
             let task = CompensationTask {
                 symbol: symbol.clone(),
                 original_order_id: spot_order.order_id,
-                base_qty_to_compensate: rounded_futures_qty,
+                base_qty_to_compensate: rounded_futures_qty, // This is correct, we need to compensate the *other* leg's quantity
                 original_direction: ArbitrageDirection::BuySpotSellFutures,
-                leg_to_compensate: OrderType::Spot,
+                leg_to_compensate: OrderType::Spot, // This is correct, we need to compensate the *successful* leg
+                is_entry: true,
             };
             if !send_cancellable(&compensation_tx, task, &shutdown).await { /* Handle error */ }
             app_state.inner.executing_pairs.remove(&symbol);
@@ -365,7 +365,8 @@ async fn execute_entry_trade_task(
                 original_order_id: futures_order.order_id,
                 base_qty_to_compensate: rounded_futures_qty,
                 original_direction: ArbitrageDirection::BuySpotSellFutures,
-                leg_to_compensate: OrderType::Futures,
+                leg_to_compensate: OrderType::Futures, // This is correct, we need to compensate the *successful* leg
+                is_entry: true,
             };
             if !send_cancellable(&compensation_tx, task, &shutdown).await { /* Handle error */ }
             app_state.inner.executing_pairs.remove(&symbol);
@@ -375,12 +376,4 @@ async fn execute_entry_trade_task(
              app_state.inner.executing_pairs.remove(&symbol);
         },
     }
-}
-
-/// Background task to place the closing orders.
-async fn execute_close_trade_task(
-    // This function is now empty as its logic has been moved into the tokio::spawn block
-    // inside handle_open_position. It can be removed.
-) {
-    // The logic from the old execute_close_trade_task is now directly inside the tokio::spawn block.
 }
