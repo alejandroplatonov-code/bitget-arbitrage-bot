@@ -36,7 +36,7 @@ pub async fn run_position_manager(
 
                 match filled_event.context {
                     OrderContext::Entry => {
-                        handle_entry_fill(filled_event, &app_state, &pending_entry_orders, &api_client, &config).await;
+                        handle_entry_fill(filled_event, app_state.clone(), &pending_entry_orders, api_client.clone(), config.clone()).await;
                     },
                     OrderContext::Exit => {
                         handle_exit_fill(filled_event, &app_state, &pending_exit_orders).await;
@@ -55,10 +55,10 @@ pub async fn run_position_manager(
 /// Обрабатывает исполнение ОДНОГО ордера на ВХОД.
 async fn handle_entry_fill(
     event: OrderFilledEvent,
-    app_state: &Arc<AppState>,
+    app_state: Arc<AppState>,
     pending_orders: &DashMap<String, (Option<OrderFilledEvent>, Option<OrderFilledEvent>)>,
-    api_client: &Arc<ApiClient>,
-    _config: &Arc<Config>, // config is now available if needed
+    api_client: Arc<ApiClient>,
+    _config: Arc<Config>, // config is now available if needed
 ) {
     let mut entry = pending_orders.entry(event.client_oid.clone()).or_default();
     match event.order_type {
@@ -100,14 +100,17 @@ async fn handle_entry_fill(
 
         info!("[PositionManager] Position for {} created. Initiating balance caching task.", &new_position.symbol);
 
-        // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
-        tokio::spawn({
-            let client = api_client.clone();
-            let position_clone = new_position.clone();
-            let symbol = new_position.symbol.clone();
-            let app_state = app_state.clone(); // Клонируем AppState для доступа к ценам
+        let position_for_task = new_position.clone();
 
-            async move {
+        let app_state_for_task = app_state.clone();
+
+        // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
+        tokio::spawn(async move {
+            let client = api_client.clone();
+            let position_clone = position_for_task;
+            let symbol = position_clone.symbol.clone(); // No change here, but showing for context
+
+            
                 info!("[BalanceCacher] Spawned for {}, waiting for balance...", symbol);
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let base_coin = symbol.replace("USDT", "");
@@ -128,8 +131,8 @@ async fn handle_entry_fill(
                     match client.get_spot_balance(&base_coin).await {
                         Ok(balance) => {
                             info!("[BalanceCacher] Balance received for {}: {:?}", base_coin, balance);
-                            // Проверяем, не является ли баланс "пылью"
-                            let spot_price = app_state.inner.market_data.get(&symbol)
+                            // Проверяем, не является ли баланс "пылью" // Use the cloned app_state
+                            let spot_price = app_state_for_task.inner.market_data.get(&symbol)
                                 .and_then(|p| p.value().spot_last_price)
                                 .unwrap_or(Decimal::ONE); // Если цены нет, считаем 1:1 для безопасности
 
@@ -152,11 +155,11 @@ async fn handle_entry_fill(
                     // Пауза перед следующей попыткой (и в случае пыли, и в случае ошибки API)
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-            }
+            
         });
         
         // Сохраняем в локальном состоянии
-        app_state.inner.active_positions.insert(spot_fill.symbol.clone(), new_position);
+        app_state.inner.active_positions.insert(spot_fill.symbol.clone(), new_position.clone());
 
         // Удаляем из временного хранилища
         pending_orders.remove(&spot_fill.client_oid);

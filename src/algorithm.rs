@@ -80,7 +80,7 @@ async fn handle_open_position(
     symbol: &str,
     position: ActivePosition,
     app_state: Arc<AppState>,
-    config: Arc<Config>,
+    _config: Arc<Config>,
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
     compensation_tx: mpsc::Sender<CompensationTask>,
