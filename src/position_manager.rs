@@ -110,52 +110,50 @@ async fn handle_entry_fill(
             let position_clone = position_for_task;
             let symbol = position_clone.symbol.clone(); // No change here, but showing for context
 
-            
-                info!("[BalanceCacher] Spawned for {}, waiting for balance...", symbol);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let base_coin = symbol.replace("USDT", "");
-                const DUST_THRESHOLD_USDT: Decimal = dec!(4);
-                const MAX_ATTEMPTS: usize = 10;
+            info!("[BalanceCacher] Spawned for {}, waiting for balance...", symbol);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let base_coin = symbol.replace("USDT", "");
+            const DUST_THRESHOLD_USDT: Decimal = dec!(4);
+            const MAX_ATTEMPTS: usize = 10;
 
-                let mut attempts = 0;
-                loop {
-                    if attempts >= MAX_ATTEMPTS {
-                        error!("[BalanceCacher] CRITICAL: Could not cache a valid (non-dust) balance for {} after {} attempts. It may not close correctly.", symbol, MAX_ATTEMPTS);
-                        error!("[BalanceCacher] CRITICAL: Could not cache balance for {}. Setting cache state to Failed.", symbol);
-                        *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Failed; // <-- Устанавливаем статус "Сбой"
-                        break;
-                    }
-                    attempts += 1;
+            let mut attempts = 0;
+            loop {
+                if attempts >= MAX_ATTEMPTS {
+                    error!("[BalanceCacher] CRITICAL: Could not cache a valid (non-dust) balance for {} after {} attempts. It may not close correctly.", symbol, MAX_ATTEMPTS);
+                    error!("[BalanceCacher] CRITICAL: Could not cache balance for {}. Setting cache state to Failed.", symbol);
+                    *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Failed; // <-- Устанавливаем статус "Сбой"
+                    break;
+                }
+                attempts += 1;
 
-                    info!("[BalanceCacher] Requesting balance for {} (attempt #{})...", base_coin, attempts);
-                    match client.get_spot_balance(&base_coin).await {
-                        Ok(balance) => {
-                            info!("[BalanceCacher] Balance received for {}: {:?}", base_coin, balance);
-                            // Проверяем, не является ли баланс "пылью" // Use the cloned app_state
-                            let spot_price = app_state_for_task.inner.market_data.get(&symbol)
-                                .and_then(|p| p.value().spot_last_price)
-                                .unwrap_or(Decimal::ONE); // Если цены нет, считаем 1:1 для безопасности
+                info!("[BalanceCacher] Requesting balance for {} (attempt #{})...", base_coin, attempts);
+                match client.get_spot_balance(&base_coin).await {
+                    Ok(balance) => {
+                        info!("[BalanceCacher] Balance received for {}: {:?}", base_coin, balance);
+                        // Проверяем, не является ли баланс "пылью" // Use the cloned app_state
+                        let spot_price = app_state_for_task.inner.market_data.get(&symbol)
+                            .and_then(|p| p.value().spot_last_price)
+                            .unwrap_or(Decimal::ONE); // Если цены нет, считаем 1:1 для безопасности
 
-                            let balance_in_usdt = balance * spot_price;
+                        let balance_in_usdt = balance * spot_price;
 
-                            if balance_in_usdt >= DUST_THRESHOLD_USDT {
-                                info!("[BalanceCacher] Successfully cached valid balance for {}: {}", symbol, balance);
-                                *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Cached(balance); // <-- Устанавливаем статус "Готово"
-                                break; // Успех, баланс валидный, выходим.
-                            } else {
-                                warn!("[BalanceCacher] Attempt #{}: Fetched balance for {} is considered dust: {} (Value: {:.2} USDT). Retrying...", attempts, symbol, balance, balance_in_usdt);
-                                // Не выходим, продолжаем цикл
-                            }
-                        },
-                        Err(e) => {
-                            error!("[BalanceCacher] Attempt #{}: Failed to fetch balance for {}: {:?}. Retrying...", attempts, symbol, e);
+                        if balance_in_usdt >= DUST_THRESHOLD_USDT {
+                            info!("[BalanceCacher] Successfully cached valid balance for {}: {}", symbol, balance);
+                            *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Cached(balance); // <-- Устанавливаем статус "Готово"
+                            break; // Успех, баланс валидный, выходим.
+                        } else {
+                            warn!("[BalanceCacher] Attempt #{}: Fetched balance for {} is considered dust: {} (Value: {:.2} USDT). Retrying...", attempts, symbol, balance, balance_in_usdt);
                             // Не выходим, продолжаем цикл
                         }
+                    },
+                    Err(e) => {
+                        error!("[BalanceCacher] Attempt #{}: Failed to fetch balance for {}: {:?}. Retrying...", attempts, symbol, e);
+                        // Не выходим, продолжаем цикл
                     }
-                    // Пауза перед следующей попыткой (и в случае пыли, и в случае ошибки API)
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-            
+                // Пауза перед следующей попыткой (и в случае пыли, и в случае ошибки API)
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         });
         
         // Сохраняем в локальном состоянии
