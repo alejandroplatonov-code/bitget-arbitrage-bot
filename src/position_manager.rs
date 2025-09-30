@@ -126,33 +126,36 @@ async fn handle_entry_fill(
                 }
                 attempts += 1;
 
-                info!("[BalanceCacher] Requesting balance for {} (attempt #{})...", base_coin, attempts);
+                info!("[BalanceCacher] [{}] Requesting balance for coin '{}' (attempt #{})...", symbol, base_coin, attempts);
                 match client.get_spot_balance(&base_coin).await {
                     Ok(balance) => {
-                        info!("[BalanceCacher] Balance received for {}: {:?}", base_coin, balance);
-                        // Проверяем, не является ли баланс "пылью" // Use the cloned app_state
-                        let spot_price = app_state_for_task.inner.market_data.get(&symbol)
-                            .and_then(|p| p.value().spot_last_price)
-                            .unwrap_or(Decimal::ONE); // Если цены нет, считаем 1:1 для безопасности
+                        info!("[BalanceCacher] [{}] Balance received for coin '{}': {}", symbol, base_coin, balance);
+                        // Проверяем, не является ли баланс "пылью".
+                        // Используем VWAP входа как наиболее надежную цену, так как она гарантированно есть.
+                        // Использование spot_last_price из market_data может дать None, если канал trades еще не прислал обновление.
+                        let spot_price = position_clone.spot_entry_vwap;
+                        if spot_price.is_zero() {
+                            warn!("[BalanceCacher] [{}] Spot entry VWAP is zero. Cannot accurately check for dust. Skipping check.", symbol);
+                        }
 
                         let balance_in_usdt = balance * spot_price;
 
                         if balance_in_usdt >= DUST_THRESHOLD_USDT {
-                            info!("[BalanceCacher] Successfully cached valid balance for {}: {}", symbol, balance);
+                            info!("[BalanceCacher] [{}] Successfully cached valid balance: {}", symbol, balance);
                             *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Cached(balance); // <-- Устанавливаем статус "Готово"
                             break; // Успех, баланс валидный, выходим.
                         } else {
-                            warn!("[BalanceCacher] Attempt #{}: Fetched balance for {} is considered dust: {} (Value: {:.2} USDT). Retrying...", attempts, symbol, balance, balance_in_usdt);
-                            // Не выходим, продолжаем цикл
+                            warn!("[BalanceCacher] [{}] Attempt #{}: Fetched balance is considered dust: {} (Value: {:.2} USDT). Retrying...", symbol, attempts, balance, balance_in_usdt);
+                            // Пауза перед следующей попыткой
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     },
                     Err(e) => {
-                        error!("[BalanceCacher] Attempt #{}: Failed to fetch balance for {}: {:?}. Retrying...", attempts, symbol, e);
-                        // Не выходим, продолжаем цикл
+                        error!("[BalanceCacher] [{}] Attempt #{}: Failed to fetch balance for coin '{}': {:?}. Retrying...", symbol, attempts, base_coin, e);
+                        // Пауза перед следующей попыткой
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
-                // Пауза перед следующей попыткой (и в случае пыли, и в случае ошибки API)
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
         
