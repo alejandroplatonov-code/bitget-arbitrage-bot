@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
 use crate::trading_logic;
-use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, PairData, TradingStatus};
+use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, PairData, TradingStatus, BalanceCacheState};
 use crate::utils::send_cancellable; //
 use std::str::FromStr;
 use rust_decimal::Decimal;
@@ -101,21 +101,27 @@ async fn handle_open_position(
         return;
     }
 
-    // --- ЭТАП 1: Получаем баланс из КЭША с повторной попыткой ---
-    let maybe_balance = {
-        // Создаем новый блок, чтобы `balance_guard` был уничтожен в его конце.
-        let balance_guard = position.cached_spot_balance.lock().unwrap();
-        *balance_guard // Копируем значение Option<Decimal>
+    // --- НОВАЯ, ФИНАЛЬНАЯ ЛОГИКА ПРОВЕРКИ ---
+    
+    // --- ЭТАП 1: Проверяем "Флаг Готовности" ---
+    let actual_spot_balance = match &*position.balance_cache.lock().unwrap() {
+        BalanceCacheState::Cached(balance) => {
+            // Идеальный случай: баланс готов, берем его и продолжаем.
+            *balance
+        },
+        BalanceCacheState::Pending => {
+            // Задача-кэшер еще работает. Молча ждем следующего тика.
+            // Логи `WARN` здесь больше не нужны, так как это штатная ситуация.
+            return;
+        },
+        BalanceCacheState::Failed => {
+            // Кэшер сдался. Мы не можем работать с этой позицией.
+            // Можно добавить логику для принудительного закрытия только фьючерсной ноги.
+            warn!("[Algorithm] Cannot evaluate exit for {}: balance caching failed.", symbol);
+            return;
+        }
     };
-
-    let actual_spot_balance = if let Some(balance) = maybe_balance {
-        balance
-    } else {
-        warn!("[Algorithm] Balance for {} not cached yet. Retrying shortly...", symbol);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        return;
-    };
-
+    
     // --- ЭТАП 2: Проверяем, достаточно ли баланса для торговли ---
    let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
     let dust_threshold = rules.min_trade_amount.unwrap_or_else(|| Decimal::from_str("0.0001").unwrap());

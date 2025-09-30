@@ -4,7 +4,7 @@ use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::order_watcher::{OrderContext, OrderFilledEvent, OrderType};
 use crate::state::AppState;
-use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade};
+use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, BalanceCacheState};
 use dashmap::DashMap;
 use rust_decimal::{dec, Decimal, prelude::FromStr};
 use std::sync::Arc;
@@ -95,7 +95,7 @@ async fn handle_entry_fill(
             futures_entry_vwap: futures_price,
             current_state: Default::default(),
             entry_spread_percent,
-            cached_spot_balance: Default::default(),
+            balance_cache: Default::default(),
         };
 
         // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
@@ -115,6 +115,8 @@ async fn handle_entry_fill(
                 loop {
                     if attempts >= MAX_ATTEMPTS {
                         error!("[BalanceCacher] CRITICAL: Could not cache a valid (non-dust) balance for {} after {} attempts. It may not close correctly.", symbol, MAX_ATTEMPTS);
+                        error!("[BalanceCacher] CRITICAL: Could not cache balance for {}. Setting cache state to Failed.", symbol);
+                        *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Failed; // <-- Устанавливаем статус "Сбой"
                         break;
                     }
                     attempts += 1;
@@ -129,9 +131,8 @@ async fn handle_entry_fill(
                             let balance_in_usdt = balance * spot_price;
 
                             if balance_in_usdt >= DUST_THRESHOLD_USDT {
-                                info!("[BalanceCacher] Attempt #{}: Successfully fetched and cached valid balance for {}: {} (Value: {:.2} USDT)", attempts, symbol, balance, balance_in_usdt);
-                                let mut cached_balance = position_clone.cached_spot_balance.lock().unwrap();
-                                *cached_balance = Some(balance);
+                                info!("[BalanceCacher] Successfully cached valid balance for {}: {}", symbol, balance);
+                                *position_clone.balance_cache.lock().unwrap() = BalanceCacheState::Cached(balance); // <-- Устанавливаем статус "Готово"
                                 break; // Успех, баланс валидный, выходим.
                             } else {
                                 warn!("[BalanceCacher] Attempt #{}: Fetched balance for {} is considered dust: {} (Value: {:.2} USDT). Retrying...", attempts, symbol, balance, balance_in_usdt);

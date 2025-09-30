@@ -69,6 +69,15 @@ pub struct PositionState {
     pub pnl_percent: Decimal,
 }
 
+// --- НОВАЯ СТРУКТУРА ДЛЯ КЭША ---
+#[derive(Debug, Default, Clone)]
+pub enum BalanceCacheState {
+    #[default]
+    Pending, // Баланс еще не запрашивался или в процессе
+    Cached(Decimal), // Баланс успешно получен и сохранен
+    Failed, // Не удалось получить баланс после нескольких попыток
+}
+
 /// Represents an active, open position for a single trading pair.
 #[derive(Debug, Clone, Serialize, Deserialize)] // Already correct, no change needed here.
 pub struct ActivePosition {
@@ -95,10 +104,9 @@ pub struct ActivePosition {
     // НОВОЕ ПОЛЕ
     pub entry_spread_percent: Decimal,
 
-    // --- НОВОЕ ПОЛЕ ---
-    // Хранит последний известный фактический баланс, обновляемый фоновой задачей.
+    // --- ЗАМЕНЯЕМ `cached_spot_balance` ---
     #[serde(skip, default = "default_cached_balance")]
-    pub cached_spot_balance: Arc<Mutex<Option<Decimal>>>,
+    pub balance_cache: Arc<Mutex<BalanceCacheState>>,
 }
 
 /// Represents a trade that has been closed.
@@ -147,8 +155,8 @@ fn default_position_state() -> Arc<Mutex<PositionState>> {
 }
 
 /// Helper function to provide a default value for the skipped field.
-fn default_cached_balance() -> Arc<Mutex<Option<Decimal>>> {
-    Arc::new(Mutex::new(None))
+fn default_cached_balance() -> Arc<Mutex<BalanceCacheState>> {
+    Arc::new(Mutex::new(BalanceCacheState::default()))
 }
 
 /// Represents a command received via the Redis channel.

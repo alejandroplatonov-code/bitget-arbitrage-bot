@@ -1,5 +1,5 @@
 // /home/platon/Bot_Bit_Get_Rust/src/balance_updater.rs
-use crate::{api_client::ApiClient, state::AppState};
+use crate::{api_client::ApiClient, state::AppState, types::BalanceCacheState};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -35,9 +35,8 @@ pub async fn run_balance_updater(
                         let base_coin = position.symbol.replace("USDT", "");
                         match client.get_spot_balance(&base_coin).await {
                             Ok(balance) => {
-                                // Записываем полученный баланс в кэш
-                                let mut cached_balance = position.cached_spot_balance.lock().unwrap();
-                                *cached_balance = Some(balance);
+                                // Записываем полученный баланс в новый кэш
+                                *position.balance_cache.lock().unwrap() = BalanceCacheState::Cached(balance);
                             },
                             Err(e) => {
                                 warn!("[BalanceUpdater] Failed to update balance for {}: {:?}", position.symbol, e);
