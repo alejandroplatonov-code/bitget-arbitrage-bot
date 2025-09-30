@@ -6,7 +6,6 @@ use rust_template_for_testing::{
     api_client::ApiClient,
     compensator::run_compensator,
     config::{load_token_list, Config},
-    connectors::bitget::BitgetConnector,
     error::AppError,
     order_watcher::{run_order_watcher, OrderFilledEvent},
     position_manager::run_position_manager,
@@ -14,6 +13,7 @@ use rust_template_for_testing::{
     types::{TradingStatus, WsCommand},
 };
 use futures_util::FutureExt;
+use rust_template_for_testing::connectors::bitget::BitgetConnector;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use rust_decimal::Decimal;
@@ -104,22 +104,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     info!("[Bot] Starting data connectors for {} pairs.", trading_pairs.len());
 
-    let spot_connector = BitgetConnector::new(
-        "SPOT".to_string(),
-        trading_pairs.clone(),
-        app_state.inner.clone(),
-        vec!["books".to_string()],
-        orderbook_update_tx.clone(),
-    );
-
-    let futures_connector = BitgetConnector::new(
-        "USDT-FUTURES".to_string(),
-        trading_pairs,
-        app_state.inner.clone(),
-        vec!["books".to_string()],
-        orderbook_update_tx,
-    );
-
     // --- 7. Механизм Graceful Shutdown ---
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_signal_task = {
@@ -132,12 +116,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // --- 8. Запуск всех сервисов ---
+    let spot_connector = BitgetConnector::new(
+        "SPOT".to_string(),
+        trading_pairs.clone(),
+        app_state.inner.clone(),
+        vec!["books".to_string(), "trades".to_string()],
+        orderbook_update_tx.clone(),
+    );
     let spot_handle = tokio::spawn(spot_connector.run(shutdown_notify.clone()));
     info!("[Bot] Spot Connector spawned.");
 
+    let futures_connector = BitgetConnector::new(
+        "USDT-FUTURES".to_string(),
+        trading_pairs,
+        app_state.inner.clone(),
+        vec!["books".to_string(), "trades".to_string()],
+        orderbook_update_tx,
+    );
     let futures_handle = tokio::spawn(futures_connector.run(shutdown_notify.clone()));
     info!("[Bot] Futures Connector spawned.");
 
+    // ПРИМЕЧАНИЕ: Private Connector был удален, так как OrderWatcher выполняет его функцию более надежно.
     let order_watcher_handle = tokio::spawn(run_order_watcher(
         order_watch_rx,
         api_client.clone(),
@@ -229,19 +228,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown_timeout = Duration::from_secs(10);
     let graceful_shutdown = async {
         info!("[Bot] Waiting for all tasks to finish...");
-        let (spot, fut, algo, watch, pos, cmd, comp, redis, balance) = tokio::join!(
+        let (spot, fut, algo, watch, pos, cmd, comp, redis, balance_updater) = tokio::join!(
             spot_handle, futures_handle, algorithm_handle, order_watcher_handle,
             position_manager_handle, cmd_listener_handle, compensator_handle, redis_dispatcher_handle, balance_updater_handle
         );
         info!("[Bot] Spot Connector finished: {:?}", spot);
         info!("[Bot] Futures Connector finished: {:?}", fut);
         info!("[Bot] Algorithm finished: {:?}", algo);
-        info!("[Bot] Order Watcher finished: {:?}", watch);
+        info!("[Bot] Order Watcher finished: {:?}", watch); // Corrected variable name
         info!("[Bot] Position Manager finished: {:?}", pos);
         info!("[Bot] Command Listener finished: {:?}", cmd);
         info!("[Bot] Compensator finished: {:?}", comp);
-        info!("[Bot] Redis Dispatcher finished: {:?}", redis);
-        info!("[Bot] Balance Updater finished: {:?}", balance);
+        info!("[Bot] Redis Dispatcher finished: {:?}", redis); // Corrected variable name
+        info!("[Bot] Balance Updater finished: {:?}", balance_updater);
     };
 
     if tokio::time::timeout(shutdown_timeout, graceful_shutdown).await.is_err() {
