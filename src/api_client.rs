@@ -86,11 +86,16 @@ pub struct FuturesOrderInfo {
 #[allow(dead_code)] // Разрешаем неиспользуемые поля, чтобы структура соответствовала API
 pub struct SpotAccountAsset {
     pub coin: String,
+    #[serde(default)]
     pub available: String, // Нам нужен именно доступный для торговли баланс
+    #[serde(default)]
     pub frozen: String,
+    #[serde(default)]
     pub locked: String,
+    #[serde(default)]
     pub limit_available: String,
     #[serde(rename = "uTime")]
+    #[serde(default)]
     pub u_time: String,
 }
 
