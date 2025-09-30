@@ -108,6 +108,7 @@ async fn handle_entry_fill(
             let app_state = app_state.clone(); // Клонируем AppState для доступа к ценам
 
             async move {
+                info!("[BalanceCacher] Spawned for {}, waiting for balance...", symbol);
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let base_coin = symbol.replace("USDT", "");
                 const DUST_THRESHOLD_USDT: Decimal = dec!(4);
@@ -123,8 +124,10 @@ async fn handle_entry_fill(
                     }
                     attempts += 1;
 
+                    info!("[BalanceCacher] Requesting balance for {} (attempt #{})...", base_coin, attempts);
                     match client.get_spot_balance(&base_coin).await {
                         Ok(balance) => {
+                            info!("[BalanceCacher] Balance received for {}: {:?}", base_coin, balance);
                             // Проверяем, не является ли баланс "пылью"
                             let spot_price = app_state.inner.market_data.get(&symbol)
                                 .and_then(|p| p.value().spot_last_price)
@@ -142,7 +145,7 @@ async fn handle_entry_fill(
                             }
                         },
                         Err(e) => {
-                            warn!("[BalanceCacher] Attempt #{}: API error fetching balance for {}: {:?}. Retrying...", attempts, symbol, e);
+                            error!("[BalanceCacher] Attempt #{}: Failed to fetch balance for {}: {:?}. Retrying...", attempts, symbol, e);
                             // Не выходим, продолжаем цикл
                         }
                     }
