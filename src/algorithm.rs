@@ -5,9 +5,8 @@ use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
 use crate::trading_logic;
-use crate::types::{ActivePosition, ArbitrageDirection, CompletedTrade, CompensationTask, PairData, TradingStatus};
+use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, PairData, TradingStatus};
 use crate::utils::send_cancellable; //
-use futures_util::{future::Either, FutureExt};
 use std::str::FromStr;
 use rust_decimal::Decimal;
 use std::sync::atomic::{Ordering};
@@ -103,22 +102,18 @@ async fn handle_open_position(
     }
 
     // --- ЭТАП 1: Получаем баланс из КЭША с повторной попыткой ---
-    let actual_spot_balance;
-    {
+    let maybe_balance = {
+        // Создаем новый блок, чтобы `balance_guard` был уничтожен в его конце.
         let balance_guard = position.cached_spot_balance.lock().unwrap();
-        if let Some(balance) = *balance_guard {
-            actual_spot_balance = balance;
-        } else {
-            // Кэш еще не готов. Вместо немедленного выхода, дадим ему шанс обновиться.
-            // Это предотвращает спам в логах, если `balance_updater` немного запаздывает.
-            warn!("[Algorithm] Balance for {} not cached yet. Retrying shortly...", symbol);
-            // Освобождаем мьютекс перед асинхронной операцией
-            drop(balance_guard);
-            // Небольшая пауза, чтобы не перегружать цикл
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            // После паузы выходим, следующая итерация цикла алгоритма попробует снова.
-            return;
-        }
+        *balance_guard // Копируем значение Option<Decimal>
+    };
+
+    let actual_spot_balance = if let Some(balance) = maybe_balance {
+        balance
+    } else {
+        warn!("[Algorithm] Balance for {} not cached yet. Retrying shortly...", symbol);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        return;
     };
 
     // --- ЭТАП 2: Проверяем, достаточно ли баланса для торговли ---
