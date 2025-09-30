@@ -126,6 +126,14 @@ pub struct ApiResponse<T> {
     pub data: Option<T>,
 }
 
+/// Specialized API response for the spot assets endpoint, which uses "message" instead of "msg".
+#[derive(Deserialize, Debug)]
+pub struct ApiAssetResponse<T> {
+    pub code: String,
+    pub message: String, // <-- ПРАВИЛЬНОЕ ИМЯ ПОЛЯ
+    pub data: Option<T>,
+}
+
 #[allow(dead_code)]
 pub struct ApiClient {
     client: Client,
@@ -320,15 +328,17 @@ impl ApiClient {
     /// Gets spot account balance for a specific coin.
     pub async fn get_spot_balance(&self, coin: &str) -> Result<Decimal, AppError> {
         let path = "/api/v2/spot/account/assets";
-        let params = format!("coin={}", coin);
+        // Передаем coin в верхнем регистре, как требует большинство API
+        let params = format!("coin={}", coin.to_uppercase());
 
         let builder = self.create_signed_get_request(path, &params)?;
         let response = builder.send().await?;
 
-        let api_response: ApiResponse<Vec<SpotAccountAsset>> = response.json().await?;
+        // Используем новую, правильную структуру для парсинга
+        let api_response: ApiAssetResponse<Vec<SpotAccountAsset>> = response.json().await?;
 
         if api_response.code != "00000" {
-            return Err(AppError::ApiError(api_response.code, api_response.msg));
+            return Err(AppError::ApiError(api_response.code, api_response.message));
         }
 
         // Заимствуем `data` через `as_ref`, чтобы не перемещать его из `api_response`.
