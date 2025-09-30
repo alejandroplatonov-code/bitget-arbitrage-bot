@@ -86,17 +86,12 @@ pub struct FuturesOrderInfo {
 #[allow(dead_code)] // Разрешаем неиспользуемые поля, чтобы структура соответствовала API
 pub struct SpotAccountAsset {
     pub coin: String,
-    #[serde(default)]
-    pub available: String, // Нам нужен именно доступный для торговли баланс
-    #[serde(default)]
-    pub frozen: String,
-    #[serde(default)]
-    pub locked: String,
-    #[serde(default)]
-    pub limit_available: String,
+    pub available: Option<String>, // Нам нужен именно доступный для торговли баланс
+    pub frozen: Option<String>,
+    pub locked: Option<String>,
+    pub limit_available: Option<String>,
     #[serde(rename = "uTime")]
-    #[serde(default)]
-    pub u_time: String,
+    pub u_time: Option<String>,
 }
 
 /// Structure for setting margin mode.
@@ -354,18 +349,19 @@ impl ApiClient {
             return Err(AppError::ApiError(api_response.code, api_response.msg));
         }
 
-        // Заимствуем `data` через `as_ref`, чтобы не перемещать его из `api_response`.
-        let balance_opt = api_response.data.as_ref()
-            .and_then(|assets| assets.first()) // Безопасно берем ссылку на первый элемент
-            .and_then(|asset| Decimal::from_str(&asset.available).ok());
+        // Логика обработки ответа:
+        // 1. `api_response.data` - это Option<Vec<SpotAccountAsset>>
+        // 2. `.and_then(|assets| assets.into_iter().next())` - извлекает первый (и единственный) элемент из вектора, если он есть.
+        // 3. `.and_then(|asset| asset.available)` - извлекает поле `available`, которое теперь Option<String>.
+        // 4. `.and_then(|s| Decimal::from_str(&s).ok())` - парсит строку в Decimal, если она не `None`.
+        // 5. `.unwrap_or_default()` - если на любом из шагов был `None`, возвращает Decimal::ZERO.
+        let balance = api_response.data
+            .and_then(|assets| assets.into_iter().next())
+            .and_then(|asset| asset.available)
+            .and_then(|s| Decimal::from_str(&s).ok())
+            .unwrap_or_default(); // Возвращаем 0, если данных нет или поле `available` равно null
 
-        if let Some(balance) = balance_opt {
-            Ok(balance)
-        } else {
-            // Теперь `api_response` полностью доступна для логирования.
-            tracing::warn!("[ApiClient] get_spot_balance for '{}' returned success code but data array was empty or balance could not be parsed. API Response: {:?}", coin, &api_response);
-            Err(AppError::LogicError(format!("Could not find or parse available balance for {}", coin)))
-        }
+        Ok(balance)
     }
 
 
