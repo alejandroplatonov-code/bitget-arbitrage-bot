@@ -102,14 +102,21 @@ async fn handle_open_position(
         return;
     }
 
-    // --- НОВАЯ, ПРАВИЛЬНАЯ ЛОГИКА ---
-
-    // --- ЭТАП 1: Получаем баланс из КЭША ---
-    let actual_spot_balance = match *position.cached_spot_balance.lock().unwrap() {
-        Some(balance) => balance,
-        None => {
-            // Кэш еще не готов, мы не можем принимать решение. Безопасно выходим.
-            warn!("[Algorithm] Cannot check exit conditions for {}: balance not cached.", symbol);
+    // --- ЭТАП 1: Получаем баланс из КЭША с повторной попыткой ---
+    let actual_spot_balance;
+    {
+        let balance_guard = position.cached_spot_balance.lock().unwrap();
+        if let Some(balance) = *balance_guard {
+            actual_spot_balance = balance;
+        } else {
+            // Кэш еще не готов. Вместо немедленного выхода, дадим ему шанс обновиться.
+            // Это предотвращает спам в логах, если `balance_updater` немного запаздывает.
+            warn!("[Algorithm] Balance for {} not cached yet. Retrying shortly...", symbol);
+            // Освобождаем мьютекс перед асинхронной операцией
+            drop(balance_guard);
+            // Небольшая пауза, чтобы не перегружать цикл
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            // После паузы выходим, следующая итерация цикла алгоритма попробует снова.
             return;
         }
     };
