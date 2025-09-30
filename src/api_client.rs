@@ -83,10 +83,15 @@ pub struct FuturesOrderInfo {
 #[derive(Deserialize, Debug)]
 #[derive(Clone)] // Добавляем Clone для возможности клонирования в логировании
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Разрешаем неиспользуемые поля, чтобы структура соответствовала API
 pub struct SpotAccountAsset {
     pub coin: String,
     pub available: String, // Нам нужен именно доступный для торговли баланс
-    // ... (frozen, lock - нам не нужны)
+    pub frozen: String,
+    pub locked: String,
+    pub limit_available: String,
+    #[serde(rename = "uTime")]
+    pub u_time: String,
 }
 
 /// Structure for setting margin mode.
@@ -126,13 +131,16 @@ pub struct ApiResponse<T> {
     pub data: Option<T>,
 }
 
-/// Specialized API response for the spot assets endpoint, which uses "message" instead of "msg".
+/// Универсальная структура ответа, которая может парсить как 'msg', так и 'message'.
+/// Bitget API для эндпоинта активов использует 'message' при успехе и 'msg' при ошибке.
 #[derive(Deserialize, Debug)]
-pub struct ApiAssetResponse<T> {
+pub struct UnifiedApiResponse<T> {
     pub code: String,
-    pub message: String, // <-- ПРАВИЛЬНОЕ ИМЯ ПОЛЯ
+    #[serde(alias = "message")] // Позволяет принимать 'message' как алиас для 'msg'
+    pub msg: String,
     pub data: Option<T>,
 }
+
 
 #[allow(dead_code)]
 pub struct ApiClient {
@@ -334,17 +342,17 @@ impl ApiClient {
         let builder = self.create_signed_get_request(path, &params)?;
         let response = builder.send().await?;
 
-        // Используем новую, правильную структуру для парсинга
-        let api_response: ApiAssetResponse<Vec<SpotAccountAsset>> = response.json().await?;
+        // Используем универсальную структуру, чтобы обработать и успешные ('message'), и ошибочные ('msg') ответы.
+        let api_response: UnifiedApiResponse<Vec<SpotAccountAsset>> = response.json().await?;
 
         if api_response.code != "00000" {
-            return Err(AppError::ApiError(api_response.code, api_response.message));
+            return Err(AppError::ApiError(api_response.code, api_response.msg));
         }
 
         // Заимствуем `data` через `as_ref`, чтобы не перемещать его из `api_response`.
         let balance_opt = api_response.data.as_ref()
             .and_then(|assets| assets.first()) // Безопасно берем ссылку на первый элемент
-            .and_then(|asset| Decimal::from_str(&asset.available).ok()); // Парсим `available` в Decimal
+            .and_then(|asset| Decimal::from_str(&asset.available).ok());
 
         if let Some(balance) = balance_opt {
             Ok(balance)
