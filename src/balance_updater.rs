@@ -37,6 +37,9 @@ pub async fn run_balance_updater(
                             Ok(balance) => {
                                 // Записываем полученный баланс в новый кэш
                                 *position.balance_cache.lock().unwrap() = BalanceCacheState::Cached(balance);
+                                // Получаем текущий спред для логирования
+                                let current_spread = position.current_state.lock().unwrap().current_spread_percent;
+                                info!("[BalanceUpdater] Updated balance for {}: {}. Current exit spread: {:.4}%", position.symbol, balance, current_spread);
                             },
                             Err(e) => {
                                 warn!("[BalanceUpdater] Failed to update balance for {}: {:?}", position.symbol, e);
