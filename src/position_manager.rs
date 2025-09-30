@@ -98,6 +98,8 @@ async fn handle_entry_fill(
             balance_cache: Default::default(),
         };
 
+        info!("[PositionManager] Position for {} created. Initiating balance caching task.", &new_position.symbol);
+
         // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
         tokio::spawn({
             let client = api_client.clone();
