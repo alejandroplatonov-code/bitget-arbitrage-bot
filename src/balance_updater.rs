@@ -20,6 +20,10 @@ pub async fn run_balance_updater(
                 // Копируем список активных позиций, чтобы не держать лок долго
                 let positions_to_update: Vec<_> = app_state.inner.active_positions.iter()
                     .map(|entry| entry.value().clone())
+                    // --- ИЗМЕНЕНИЕ: Фильтруем позиции, которые уже в процессе закрытия ---
+                    // Если пара находится в `executing_pairs`, значит, для нее уже отправлены
+                    // ордера на закрытие, и нет смысла продолжать обновлять для нее баланс.
+                    .filter(|pos| !app_state.inner.executing_pairs.contains(&pos.symbol))
                     .collect();
 
                 if positions_to_update.is_empty() {
