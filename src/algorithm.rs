@@ -273,7 +273,8 @@ fn check_and_execute_arbitrage(
     compensation_tx: mpsc::Sender<CompensationTask>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
-    let last_price = match pair_data.futures_book.asks.iter().next() {
+    // Мы собираемся ПРОДАТЬ фьючерсы, поэтому для расчета объема берем лучшую цену BID.
+    let last_price = match pair_data.futures_book.bids.iter().rev().next() { // .rev() чтобы взять самую высокую цену bid
         Some((&price, _)) if !price.is_zero() => price,
         _ => return,
     };
