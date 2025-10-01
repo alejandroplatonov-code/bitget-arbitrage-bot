@@ -3,11 +3,18 @@
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradeExecutionDetail {
+    pub price: Decimal,
+    pub qty: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VwapResult {
     pub total_quote_qty: Decimal, // Общая сумма в USDT (затраты или выручка)
     pub total_base_qty: Decimal,  // Общее количество базового актива (например, BTC)
     pub vwap: Decimal,            // Рассчитанная средневзвешенная цена
+    pub levels_consumed: Vec<TradeExecutionDetail>, // Детализация по уровням
 }
 
 /// Назначение: Реализация пункта 2.2 математической модели. Рассчитывает, сколько USDT нужно потратить (C_entry или C_exit),
@@ -33,6 +40,7 @@ pub fn calculate_cost_to_acquire(
     let mut total_quote_qty = Decimal::ZERO;
     let mut total_base_qty = Decimal::ZERO;
     let mut remaining_base_to_buy = base_quantity_to_buy;
+    let mut levels_consumed = Vec::new();
 
     // Итерируемся по аскам от самой низкой цены (лучшей для покупки) к высокой.
     for (&price, &size) in asks.iter() {
@@ -40,12 +48,14 @@ pub fn calculate_cost_to_acquire(
             // Этот уровень цен полностью покрывает оставшуюся потребность.
             total_quote_qty += remaining_base_to_buy * price;
             total_base_qty += remaining_base_to_buy;
+            levels_consumed.push(TradeExecutionDetail { price, qty: remaining_base_to_buy });
             remaining_base_to_buy = Decimal::ZERO;
             break; // Мы купили все, что хотели.
         } else {
             // Забираем весь объем с этого уровня цен и переходим к следующему.
             total_quote_qty += size * price;
             total_base_qty += size;
+            levels_consumed.push(TradeExecutionDetail { price, qty: size });
             remaining_base_to_buy -= size;
         }
     }
@@ -56,6 +66,7 @@ pub fn calculate_cost_to_acquire(
             total_quote_qty,
             total_base_qty,
             vwap,
+            levels_consumed,
         })
     } else {
         // Ликвидности в стакане не хватило.
@@ -86,6 +97,7 @@ pub fn calculate_revenue_from_sale(
     let mut total_quote_qty = Decimal::ZERO;
     let mut total_base_qty = Decimal::ZERO;
     let mut remaining_base_to_sell = base_quantity_to_sell;
+    let mut levels_consumed = Vec::new();
 
     // Итерируемся по бидам от самой высокой цены (лучшей для продажи) к низкой.
     for (&price, &size) in bids.iter().rev() {
@@ -93,12 +105,14 @@ pub fn calculate_revenue_from_sale(
             // Этот уровень цен полностью покрывает оставшуюся потребность в продаже.
             total_quote_qty += remaining_base_to_sell * price;
             total_base_qty += remaining_base_to_sell;
+            levels_consumed.push(TradeExecutionDetail { price, qty: remaining_base_to_sell });
             remaining_base_to_sell = Decimal::ZERO;
             break; // Мы продали все, что хотели.
         } else {
             // Продаем весь объем на этом уровне цен и переходим к следующему.
             total_quote_qty += size * price;
             total_base_qty += size;
+            levels_consumed.push(TradeExecutionDetail { price, qty: size });
             remaining_base_to_sell -= size;
         }
     }
@@ -109,6 +123,7 @@ pub fn calculate_revenue_from_sale(
             total_quote_qty,
             total_base_qty,
             vwap,
+            levels_consumed,
         })
     } else {
         // Ликвидности в стакане не хватило.
@@ -139,6 +154,7 @@ pub fn calculate_qty_for_target_revenue(
     let mut total_quote_qty = Decimal::ZERO;
     let mut total_base_qty = Decimal::ZERO;
     let mut remaining_quote_to_receive = quote_quantity_to_receive;
+    let mut levels_consumed = Vec::new();
 
     // Итерируемся по бидам от самой высокой цены (лучшей для продажи) к низкой.
     for (&price, &size) in bids.iter().rev() {
@@ -150,12 +166,14 @@ pub fn calculate_qty_for_target_revenue(
             let partial_base_qty = remaining_quote_to_receive / price;
             total_base_qty += partial_base_qty;
             total_quote_qty += remaining_quote_to_receive; // или partial_base_qty * price
+            levels_consumed.push(TradeExecutionDetail { price, qty: partial_base_qty });
             remaining_quote_to_receive = Decimal::ZERO;
             break; // Цель достигнута.
         } else {
             // Забираем всю ликвидность с этого уровня и идем дальше.
             total_quote_qty += quote_at_level;
             total_base_qty += size;
+            levels_consumed.push(TradeExecutionDetail { price, qty: size });
             remaining_quote_to_receive -= quote_at_level;
         }
     }
@@ -166,6 +184,7 @@ pub fn calculate_qty_for_target_revenue(
             total_quote_qty,
             total_base_qty,
             vwap,
+            levels_consumed,
         })
     } else {
         // Ликвидности в стакане не хватило.

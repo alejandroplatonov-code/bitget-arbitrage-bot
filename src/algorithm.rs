@@ -262,6 +262,14 @@ async fn handle_unopened_pair(
     check_and_execute_arbitrage(&symbol, &pair_data, app_state, config, api_client, order_watch_tx, compensation_tx, shutdown);
 }
 
+/// Форматирует детализацию уровней стакана для логирования.
+fn format_levels(levels: &[crate::trading_logic::TradeExecutionDetail]) -> String {
+    levels.iter()
+        .map(|detail| format!("(P:{:.8}, Q:{:.4})", detail.price, detail.qty))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Synchronously checks for an arbitrage opportunity and spawns a background task to execute it.
 fn check_and_execute_arbitrage(
     symbol: &str,
@@ -294,17 +302,19 @@ fn check_and_execute_arbitrage(
             let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
             let rounded_futures_qty = base_qty_n.trunc_with_scale(fut_scale);
 
+            // --- ФИНАЛЬНЫЙ ФОРМАТ ЛОГИРОВАНИЯ ---
             info!(
+                "[{symbol}]: ENTRY TRIGGERED. Gross Spread: {spread}\n  ├─ SELL FUTURES (Sim): Qty:{f_qty:.4}, VWAP:{f_vwap:.8}, Revenue:{f_rev:.4} USDT\n  │   └─ Levels: {f_levels}\n  └─ BUY SPOT (Sim):     Qty:{s_qty:.4}, VWAP:{s_vwap:.8}, Cost:{s_cost:.4} USDT\n      └─ Levels: {s_levels}",
                 symbol = symbol,
-                spread_percent = format!("{:.4}%", spread_percent),
-                "\n--- ENTRY TRIGGERED ---\n\
-                [Simulation] Sell Futures (get revenue):\n\
-                \tQty:   {}\n\tVWAP:  {}\n\tValue: {} USDT\n\
-                [Simulation] Buy Spot (pay cost):\n\
-                \tQty:   {}\n\tVWAP:  {}\n\tValue: {} USDT\n\
-                Spawning execution task...",
-                sell_futures_res.total_base_qty, sell_futures_res.vwap, sell_futures_res.total_quote_qty,
-                buy_spot_res.total_base_qty, buy_spot_res.vwap, buy_spot_res.total_quote_qty
+                spread = format!("{:.4}%", spread_percent),
+                f_qty = sell_futures_res.total_base_qty,
+                f_vwap = sell_futures_res.vwap,
+                f_rev = sell_futures_res.total_quote_qty,
+                f_levels = format_levels(&sell_futures_res.levels_consumed),
+                s_qty = buy_spot_res.total_base_qty,
+                s_vwap = buy_spot_res.vwap,
+                s_cost = buy_spot_res.total_quote_qty,
+                s_levels = format_levels(&buy_spot_res.levels_consumed)
             );
 
             if config.live_trading_enabled {
