@@ -133,6 +133,19 @@ async fn handle_open_position(
     );
 
     if let (Some(r_exit_res), Some(c_exit_res)) = (r_exit_opt, c_exit_opt) {
+        let exit_spread_percent = if !c_exit_res.total_quote_qty.is_zero() {
+            ((r_exit_res.total_quote_qty - c_exit_res.total_quote_qty) / c_exit_res.total_quote_qty) * Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+
+        info!(
+            "[Position Health] Symbol: {}, Spot Balance: {:.4}, Futures Pos: {:.4}, Current Exit Spread: {:.4}%",
+            symbol,
+            actual_spot_balance,
+            actual_futures_position,
+            exit_spread_percent
+        );
         // --- STAGE 5: Make a decision based on the simulation ---
         let close_reason = if app_state.inner.force_close_requests.remove(symbol).is_some() {
             Some("Force Closed by User")
