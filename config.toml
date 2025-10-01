@@ -23,7 +23,7 @@ ui_update_ms = 1000
 live_trading_enabled = true
 
 # Максимальное количество одновременно открытых позиций
-max_active_positions = 2
+max_active_positions = 1
 
 # Задержка в миллисекундах между проверками одной и той же пары (троттлинг)
 throttle_ms = 50

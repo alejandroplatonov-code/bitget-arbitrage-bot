@@ -79,6 +79,16 @@ pub struct FuturesOrderInfo {
     pub client_oid: Option<String>,
 }
 
+/// Structure for the futures position info response.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FuturesPositionInfo {
+    pub symbol: String,
+    pub hold_side: String, // "long" or "short"
+    pub total: String,     // The total amount of positions
+    // We can ignore other fields like avgPrice, margin, etc. for this task
+}
+
 /// --- НОВЫЕ СТРУКТУРЫ ДЛЯ БАЛАНСА ---
 #[derive(Deserialize, Debug)]
 #[derive(Clone)] // Добавляем Clone для возможности клонирования в логировании
@@ -362,6 +372,40 @@ impl ApiClient {
             .unwrap_or_default(); // Возвращаем 0, если данных нет или поле `available` равно null
 
         Ok(balance)
+    }
+
+    /// Gets the size of a specific futures position.
+    /// Returns the size as a positive Decimal if a short position exists, or Decimal::ZERO otherwise.
+    pub async fn get_futures_position(&self, symbol: &str) -> Result<Decimal, AppError> {
+        let path = "/api/v2/mix/position/single-position";
+        let params = format!(
+            "symbol={}&productType=USDT-FUTURES&marginCoin=USDT",
+            symbol
+        );
+
+        let builder = self.create_signed_get_request(path, &params)?;
+        let response = builder.send().await?;
+
+        let api_response: ApiResponse<Vec<FuturesPositionInfo>> = response.json().await?;
+
+        if api_response.code != "00000" {
+            return Err(AppError::ApiError(api_response.code, api_response.msg));
+        }
+
+        // The API returns an array. We need to find our short position.
+        // For a single symbol query, it should contain at most one "long" and one "short".
+        let position_size = api_response
+            .data
+            .and_then(|positions| {
+                positions
+                    .into_iter()
+                    .find(|p| p.hold_side == "short") // We are only interested in short positions for our strategy
+                    .and_then(|p| Decimal::from_str(&p.total).ok())
+            })
+            .unwrap_or_default(); // If no short position is found or parsing fails, default to zero.
+
+        // The `total` is always positive, which is what we want.
+        Ok(position_size)
     }
 
 

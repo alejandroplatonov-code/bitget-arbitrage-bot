@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
 use crate::trading_logic;
-use crate::types::{ActivePosition, ArbitrageDirection, BalanceCacheState, CompensationTask, PairData, TradingStatus};
+use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, PairData, TradingStatus};
 use crate::utils::send_cancellable;
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -78,7 +78,7 @@ pub async fn run_trading_algorithm(
 /// Handles an open position: checks for exit conditions and executes the closing trade.
 async fn handle_open_position(
     symbol: &str,
-    position: ActivePosition,
+    _position: ActivePosition,
     app_state: Arc<AppState>,
     _config: Arc<Config>,
     api_client: Arc<ApiClient>,
@@ -90,39 +90,50 @@ async fn handle_open_position(
         return;
     }
 
-    // --- ЭТАП 1: Получаем баланс из кэша ---
-    let actual_spot_balance = match &*position.balance_cache.lock().unwrap() {
-        BalanceCacheState::Cached(balance) => *balance,
-        BalanceCacheState::Pending => {
-            // Это нормальная ситуация, кэш еще не успел заполниться. Просто пропускаем.
+    // --- STAGE 1: Concurrently fetch actual spot balance and futures position size ---
+    let base_coin = symbol.replace("USDT", "");
+    let (spot_balance_res, futures_pos_res) = tokio::join!(
+        api_client.get_spot_balance(&base_coin),
+        api_client.get_futures_position(symbol)
+    );
+
+    let (actual_spot_balance, actual_futures_position) = match (spot_balance_res, futures_pos_res) {
+        (Ok(spot), Ok(fut)) => (spot, fut),
+        (Err(e), _) => {
+            warn!("[Algorithm] Failed to get spot balance for {}: {:?}. Skipping exit check.", symbol, e);
             return;
-        },
-        BalanceCacheState::Failed => {
-            warn!("[Algorithm] Невозможно оценить выход для {}: кэширование баланса провалилось.", symbol);
+        }
+        (_, Err(e)) => {
+            warn!("[Algorithm] Failed to get futures position for {}: {:?}. Skipping exit check.", symbol, e);
             return;
         }
     };
 
-    // --- STAGE 2: Check if balance is tradeable ---
+    // --- STAGE 2: Determine the safe quantity to close ---
+    // This is the core of the safety mechanism. We can only close the minimum of what we have on both legs.
+    let close_quantity = actual_spot_balance.min(actual_futures_position);
+
+    // --- STAGE 3: Check if the safe quantity is above the dust threshold ---
     let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
-    let dust_threshold = rules.min_trade_amount.unwrap_or_else(|| Decimal::from_str("0.0001").unwrap());
-    if actual_spot_balance < dust_threshold {
-        // Balance is too small to trade, nothing to do.
+    // Using a safe fallback for min_trade_amount, though it should be fetched from the API.
+    let min_trade_qty = rules.min_trade_amount.unwrap_or_else(|| Decimal::from_str("0.0001").unwrap());
+    if close_quantity < min_trade_qty {
+        // The tradeable amount is too small (dust), nothing to do.
         return;
     }
 
-    // --- STAGE 3: Simulate the exit trade using the ACTUAL balance ---
+    // --- STAGE 4: Simulate the exit trade using the SAFE quantity ---
     let pair_data = match app_state.inner.market_data.get(symbol) {
         Some(data) => data.clone(),
         None => return,
     };
     let (r_exit_opt, c_exit_opt) = (
-        trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, actual_spot_balance),
-        trading_logic::calculate_cost_to_acquire(&pair_data.futures_book.asks, actual_spot_balance),
+        trading_logic::calculate_revenue_from_sale(&pair_data.spot_book.bids, close_quantity),
+        trading_logic::calculate_cost_to_acquire(&pair_data.futures_book.asks, close_quantity),
     );
 
     if let (Some(r_exit_res), Some(c_exit_res)) = (r_exit_opt, c_exit_opt) {
-        // --- STAGE 4: Make a decision based on the CORRECT simulation ---
+        // --- STAGE 5: Make a decision based on the simulation ---
         let close_reason = if app_state.inner.force_close_requests.remove(symbol).is_some() {
             Some("Force Closed by User")
         } else if r_exit_res.total_quote_qty >= c_exit_res.total_quote_qty {
@@ -131,54 +142,54 @@ async fn handle_open_position(
             None
         };
 
-        // --- STAGE 5: Execute if a decision was made ---
+        // --- STAGE 6: Execute if a decision was made ---
         if let Some(reason) = close_reason {
             if !app_state.inner.executing_pairs.insert(symbol.to_string()) { return; }
-            info!("[{}] EXIT TRIGGERED. Reason: {}. Actual spot balance: {}. Sim Exit Revenue: {:.4}, Sim Exit Cost: {:.4}", // Corrected log format
-                symbol, reason, actual_spot_balance, r_exit_res.total_quote_qty, c_exit_res.total_quote_qty);
+            info!("[{}] EXIT TRIGGERED. Reason: {}. Safe Close Qty: {}. Spot Balance: {}, Futures Pos: {}. Sim Exit Revenue: {:.4}, Sim Exit Cost: {:.4}",
+                symbol, reason, close_quantity, actual_spot_balance, actual_futures_position, r_exit_res.total_quote_qty, c_exit_res.total_quote_qty);
 
-            // --- ЗАПОЛНЯЕМ ЭТОТ БЛОК ---
             tokio::spawn({
-                // Клонируем все необходимые переменные из внешней области видимости
-                let client = api_client.clone(); // Используем переменные с `_` из сигнатуры
+                let client = api_client.clone();
                 let order_tx = order_watch_tx.clone();
                 let symbol = symbol.to_string();
                 let compensation_tx = compensation_tx.clone();
                 let app_state = app_state.clone();
                 let shutdown = shutdown.clone();
-                let final_close_qty = actual_spot_balance; // `actual_spot_balance`, рассчитанный на основе кэша
 
                 async move {
                     let rules = app_state.inner.symbol_rules.get(&symbol)
                         .map(|r| *r.value())
                         .unwrap_or_default();
                     let client_oid = uuid::Uuid::new_v4().to_string();
-            
+
+                    // --- Apply individual rounding rules to the safe quantity ---
                     let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
                     let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4);
-            
-                    let spot_close_qty = final_close_qty.trunc_with_scale(spot_quantity_scale);
-                    let futures_close_qty = final_close_qty.trunc_with_scale(futures_quantity_scale);
-            
+
+                    let spot_close_qty = close_quantity.trunc_with_scale(spot_quantity_scale);
+                    let futures_close_qty = close_quantity.trunc_with_scale(futures_quantity_scale);
+
+                    // Place Spot Sell Order
                     let spot_task = {
                         let req = PlaceOrderRequest {
                             symbol: symbol.clone(),
                             side: "sell".to_string(),
                             order_type: "market".to_string(),
                             force: "gtc".to_string(),
-                            size: spot_close_qty.to_string(), // Quantity in base currency for market sell
+                            size: spot_close_qty.to_string(),
                             client_oid: Some(client_oid.clone()),
                         };
                         client.place_spot_order(req)
                     };
-            
+
+                    // Place Futures Buy (to close short) Order
                     let fut_task = {
                         let req = PlaceFuturesOrderRequest {
                             symbol: symbol.clone(),
                             product_type: "USDT-FUTURES".to_string(),
                             margin_mode: "isolated".to_string(),
                             margin_coin: "USDT".to_string(),
-                            size: futures_close_qty.to_string(), // Quantity in base asset
+                            size: futures_close_qty.to_string(),
                             side: "buy".to_string(),
                             trade_side: None,
                             order_type: "market".to_string(),
@@ -186,9 +197,9 @@ async fn handle_open_position(
                         };
                         client.place_futures_order(req)
                     };
-            
+
                     let (spot_res, fut_res) = tokio::join!(spot_task, fut_task);
-            
+
                     match (spot_res, fut_res) {
                         (Ok(spot_ord), Ok(fut_ord)) => {
                             info!("[{}] CLOSE SUCCESS: Both close orders placed. Spot ID: {}, Futures ID: {}", &symbol, spot_ord.order_id, fut_ord.order_id);
@@ -217,6 +228,7 @@ async fn handle_open_position(
         }
     }
 }
+
 /// Handles a pair with no open position: checks limits and spawns an execution task if profitable.
 async fn handle_unopened_pair(
     symbol: String,
