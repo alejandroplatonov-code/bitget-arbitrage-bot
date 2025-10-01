@@ -294,7 +294,18 @@ fn check_and_execute_arbitrage(
             let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
             let rounded_futures_qty = base_qty_n.trunc_with_scale(fut_scale);
 
-            info!("[{}] ENTRY TRIGGERED. Gross Spread: {:.4}%. Base Qty (N): {}. Spawning execution task...", symbol, spread_percent, rounded_futures_qty);
+            info!(
+                symbol = symbol,
+                spread_percent = format!("{:.4}%", spread_percent),
+                "\n--- ENTRY TRIGGERED ---\n\
+                [Simulation] Sell Futures (get revenue):\n\
+                \tQty:   {}\n\tVWAP:  {}\n\tValue: {} USDT\n\
+                [Simulation] Buy Spot (pay cost):\n\
+                \tQty:   {}\n\tVWAP:  {}\n\tValue: {} USDT\n\
+                Spawning execution task...",
+                sell_futures_res.total_base_qty, sell_futures_res.vwap, sell_futures_res.total_quote_qty,
+                buy_spot_res.total_base_qty, buy_spot_res.vwap, buy_spot_res.total_quote_qty
+            );
 
             if config.live_trading_enabled {
                 tokio::spawn(execute_entry_trade_task(
