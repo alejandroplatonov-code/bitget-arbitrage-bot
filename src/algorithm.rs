@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
 use crate::trading_logic;
-use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, PairData, TradingStatus};
+use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, MarketSnapshot, PairData, TradeAnalysisLog, TradingStatus};
 use crate::utils::send_cancellable;
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -270,6 +270,14 @@ fn format_levels(levels: &[crate::trading_logic::TradeExecutionDetail]) -> Strin
         .join(" | ")
 }
 
+/// Форматирует N уровней стакана для лога анализа.
+fn format_levels_for_analysis(levels: &[(Decimal, Decimal)]) -> String {
+    levels.iter()
+        .map(|(price, qty)| format!("(P:{}, Q:{})", price, qty))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Synchronously checks for an arbitrage opportunity and spawns a background task to execute it.
 fn check_and_execute_arbitrage(
     symbol: &str,
@@ -297,12 +305,31 @@ fn check_and_execute_arbitrage(
 
         if spread_percent >= config.spread_threshold_percent {
             if !app_state.inner.executing_pairs.insert(symbol.to_string()) { return; }
-            
+
+            // --- ЧАСТЬ 2: СБОР ДАННЫХ T1 ---
+            let client_oid = uuid::Uuid::new_v4().to_string();
+            let simulation_log_str = format!(
+                "Gross Spread: {spread:.4}% | R_fut: {f_rev:.4}, C_spot: {s_cost:.4}",
+                spread = spread_percent,
+                f_rev = sell_futures_res.total_quote_qty,
+                s_cost = buy_spot_res.total_quote_qty
+            );
+
+            let analysis_log = TradeAnalysisLog {
+                symbol: symbol.to_string(),
+                client_oid: client_oid.clone(),
+                simulation_log: simulation_log_str,
+                snapshot_at_decision: MarketSnapshot {
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids.iter().rev().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
+                    spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks.iter().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
+                },
+                ..Default::default()
+            };
+
             let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
             let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
             let rounded_futures_qty = base_qty_n.trunc_with_scale(fut_scale);
-
-            // --- ФИНАЛЬНЫЙ ФОРМАТ ЛОГИРОВАНИЯ ---
             info!(
                 "[{symbol}]: ENTRY TRIGGERED. Gross Spread: {spread}\n  ├─ SELL FUTURES (Sim): Qty:{f_qty:.4}, VWAP:{f_vwap:.8}, Revenue:{f_rev:.4} USDT\n  │   └─ Levels: {f_levels}\n  └─ BUY SPOT (Sim):     Qty:{s_qty:.4}, VWAP:{s_vwap:.8}, Cost:{s_cost:.4} USDT\n      └─ Levels: {s_levels}",
                 symbol = symbol,
@@ -317,12 +344,15 @@ fn check_and_execute_arbitrage(
                 s_levels = format_levels(&buy_spot_res.levels_consumed)
             );
 
+            // Вставляем лог в хранилище
+            app_state.inner.trade_analysis_logs.insert(client_oid.clone(), analysis_log);
+
             if config.live_trading_enabled {
                 tokio::spawn(execute_entry_trade_task(
                     symbol.to_string(),
                     buy_spot_res.total_quote_qty,
                     rounded_futures_qty,
-                    uuid::Uuid::new_v4().to_string(),
+                    client_oid,
                     app_state,
                     config,
                     api_client,
@@ -353,6 +383,21 @@ async fn execute_entry_trade_task(
     let cost_with_slippage = cost_spot_entry * (Decimal::ONE + config.spot_slippage_buffer_percent / Decimal::from(100));
     const GLOBAL_PRICE_SCALE: u32 = 4;
     let rounded_spot_cost = cost_with_slippage.trunc_with_scale(GLOBAL_PRICE_SCALE);
+
+    // --- ЧАСТЬ 2: СБОР ДАННЫХ T2 ---
+    if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
+        if let Some(pair_data) = app_state.inner.market_data.get(&symbol) {
+            let snapshot = MarketSnapshot {
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids.iter().rev().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
+                spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks.iter().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
+            };
+            analysis_log_entry.value_mut().snapshot_before_send = snapshot;
+        }
+    } else {
+        warn!("[Analysis] Could not find TradeAnalysisLog for clientOid {} before sending orders.", client_oid);
+    }
+
 
     let (spot_res, fut_res) = tokio::join!(
         async {
@@ -387,6 +432,14 @@ async fn execute_entry_trade_task(
     match (spot_res, fut_res) {
         (Ok(spot_order), Ok(futures_order)) => {
             info!("[{}] ENTRY SUCCESS: Both entry orders placed. Spot ID: {}, Futures ID: {}", &symbol, &spot_order.order_id, &futures_order.order_id);
+            
+            // --- ЧАСТЬ 2: СБОР ДАННЫХ T3 ---
+            if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
+                analysis_log_entry.value_mut().timestamp_accepted = chrono::Utc::now().timestamp_millis();
+            } else {
+                warn!("[Analysis] Could not find TradeAnalysisLog for clientOid {} after orders were accepted.", client_oid);
+            }
+
             let spot_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_order.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Entry };
             let fut_req = WatchOrderRequest { symbol: symbol.clone(), order_id: futures_order.order_id, order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Entry };
             if !send_cancellable(&order_watch_tx, spot_req, &shutdown).await { /* Handle error */ }

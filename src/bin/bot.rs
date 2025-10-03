@@ -6,17 +6,23 @@ use rust_template_for_testing::{
     api_client::ApiClient,
     compensator::run_compensator,
     config::{load_token_list, Config},
-    error::AppError,
+    error::AppError, 
     order_watcher::{run_order_watcher, OrderFilledEvent},
+    state::{AppState, AppStateInner}, // <--- ДОБАВЛЕНО: Импортируем правильные структуры
     position_manager::run_position_manager,
-    state::AppState,
-    types::{TradingStatus, WsCommand},
+    types::{
+        ActivePosition, CompletedTrade, PairData, SymbolRules, TradeAnalysisLog, TradingStatus,
+        WsCommand,
+    },
 };
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use rust_template_for_testing::connectors::bitget::BitgetConnector;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use rust_decimal::Decimal;
+use std::sync::atomic::AtomicU8;
+
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::sync::Arc;

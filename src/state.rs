@@ -1,4 +1,4 @@
-use crate::types::{ActivePosition, CompletedTrade, PairData, SymbolRules, TradingStatus};
+use crate::types::{ActivePosition, CompletedTrade, PairData, SymbolRules, TradeAnalysisLog, TradingStatus};
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,6 +23,8 @@ pub struct AppStateInner {
     pub last_checked: DashMap<String, Instant>,
     /// Правила торговли (округление и т.д.) для каждой пары.
     pub symbol_rules: DashMap<String, SymbolRules>,
+    /// "Черный ящик" для анализа сделок. Ключ - clientOid.
+    pub trade_analysis_logs: DashMap<String, TradeAnalysisLog>,
 }
 
 /// A clonable, thread-safe handle to the application's shared state.
@@ -44,6 +46,7 @@ impl AppState {
                 trading_status: AtomicU8::new(TradingStatus::Running as u8),
                 last_checked: DashMap::new(),
                 symbol_rules: DashMap::new(),
+                trade_analysis_logs: DashMap::new(),
             }),
         }
     }

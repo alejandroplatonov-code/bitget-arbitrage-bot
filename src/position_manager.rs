@@ -102,7 +102,7 @@ async fn handle_entry_fill(
 
         let position_for_task = new_position.clone();
 
-        let app_state_for_task = app_state.clone();
+        let _app_state_for_task = app_state.clone();
 
         // --- НОВАЯ ЛОГИКА: Запускаем фоновую задачу для кэширования баланса ---
         tokio::spawn(async move {

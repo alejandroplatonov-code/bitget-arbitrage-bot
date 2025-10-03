@@ -167,3 +167,46 @@ pub struct WsCommand {
     pub action: String,
     pub symbol: Option<String>, // Optional symbol for targeted commands
 }
+
+// --- НОВЫЕ СТРУКТУРЫ ДЛЯ "БОРТОВОГО САМОПИСЦА" ---
+
+/// Снимок ключевых данных стакана в определенный момент времени.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MarketSnapshot {
+    pub timestamp: i64,
+    pub futures_bids: String, // Храним уже отформатированную строку
+    pub spot_asks: String,
+}
+
+/// "Черный ящик" для одной сделки, собирающий диагностическую информацию.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeAnalysisLog {
+    pub symbol: String,
+    pub client_oid: String,
+    pub simulation_log: String, // Лог из ENTRY TRIGGERED
+    pub snapshot_at_decision: MarketSnapshot, // T1
+    pub snapshot_before_send: MarketSnapshot, // T2
+    pub timestamp_accepted: i64, // T3 (время из ENTRY SUCCESS)
+    // Ключ - orderId, значение - (время T4, реальное исполнение)
+    #[serde(skip, default = "default_execution_logs")]
+    pub execution_logs: Arc<dashmap::DashMap<String, (i64, String)>>,
+}
+
+impl Default for TradeAnalysisLog {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            client_oid: String::new(),
+            simulation_log: String::new(),
+            snapshot_at_decision: Default::default(),
+            snapshot_before_send: Default::default(),
+            timestamp_accepted: 0,
+            execution_logs: default_execution_logs(),
+        }
+    }
+}
+
+/// Helper function to provide a default value for the skipped field.
+fn default_execution_logs() -> Arc<dashmap::DashMap<String, (i64, String)>> {
+    Arc::new(dashmap::DashMap::new())
+}
