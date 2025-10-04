@@ -52,15 +52,33 @@ struct FuturesSymbolInfo {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // --- 1. Инициализация Логирования ---
-    let file_appender = rolling::daily("logs", "bot.log");
-    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // --- 1. Инициализация Раздельного Логирования ---
+    // Основной логгер для событий бота
+    let main_log_appender = rolling::daily("logs", "bot.log");
+    let (non_blocking_main, _main_guard) = tracing_appender::non_blocking(main_log_appender);
 
+    // Логгер для аудита стаканов
+    let orderbook_log_appender = rolling::daily("logs", "orderbooks.log");
+    let (non_blocking_orderbook, _orderbook_guard) = tracing_appender::non_blocking(orderbook_log_appender);
+
+    // Фильтр для консоли и основного лога: по умолчанию 'info', но отключаем 'orderbook_logger'
+    let main_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("orderbook_logger=off".parse().unwrap());
+
+    // Фильтр только для лога стаканов: только то, что помечено как 'orderbook_logger'
+    let orderbook_filter = EnvFilter::new("orderbook_logger=info");
+
+    // Собираем подписчик с несколькими слоями
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(std::io::stdout).with_ansi(true))
-        .with(fmt::layer().with_writer(non_blocking_file).with_ansi(false))
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(true)
+                .with_filter(main_filter.clone()), // Основной фильтр для консоли
+        )
+        .with(fmt::layer().with_writer(non_blocking_main).with_ansi(false).with_filter(main_filter)) // ...и для основного файла
+        .with(fmt::layer().with_writer(non_blocking_orderbook).with_ansi(false).with_filter(orderbook_filter)) // Специальный фильтр для файла стаканов
         .init();
 
     info!("[Bot] Trading Bot starting...");

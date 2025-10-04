@@ -306,6 +306,20 @@ fn check_and_execute_arbitrage(
         if spread_percent >= config.spread_threshold_percent {
             if !app_state.inner.executing_pairs.insert(symbol.to_string()) { return; }
 
+            // --- ЧАСТЬ 1: ЛОГИРОВАНИЕ СТАКАНОВ ДЛЯ АУДИТА ---
+            // Это сообщение будет направлено в отдельный файл (orderbooks.log)
+            info!(
+                target: "orderbook_logger",
+                "[{symbol}] Snapshot for spread {spread:.4}%:\n  ├─ FUTURES BIDS: {f_bids}\n  └─ SPOT ASKS:    {s_asks}",
+                symbol = symbol,
+                spread = spread_percent,
+                f_bids = format_levels_for_analysis(&pair_data.futures_book.bids.iter().rev().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
+                s_asks = format_levels_for_analysis(&pair_data.spot_book.asks.iter().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>())
+            );
+
+            // --- ОСНОВНОЙ ЛОГ О СРАБАТЫВАНИИ ---
+            // Это сообщение пойдет в основной лог (bot.log) и в консоль
+
             // --- ЧАСТЬ 2: СБОР ДАННЫХ T1 ---
             let client_oid = uuid::Uuid::new_v4().to_string();
             let simulation_log_str = format!(

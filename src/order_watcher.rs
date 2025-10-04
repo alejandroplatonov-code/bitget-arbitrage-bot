@@ -64,34 +64,32 @@ pub async fn run_order_watcher(
 ) {
     info!("[OrderWatcher] Service started.");
 
-    // --- ИЗМЕНЕНИЕ 1: Создаем JoinSet для управления задачами-трекерами ---
     let mut tracking_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
-            // Ветка 1: Получаем новый ордер для отслеживания
+            biased;
+            _ = shutdown.notified() => {
+                info!("[OrderWatcher] Shutdown signal received. Aborting all active order trackers.");
+                tracking_tasks.abort_all();
+                break;
+            },
             Some(request) = order_rx.recv() => {
                 info!("[OrderWatcher] Received request to watch order ID: {} (clientOid: {})", request.order_id, request.client_oid);
                 let client_clone = api_client.clone();
                 let tx_clone = order_filled_tx.clone();
-                let shutdown_clone = shutdown.clone(); // Клонируем для задачи
+                let shutdown_clone = shutdown.clone();
                 let app_state_clone = _app_state.clone();
-                // --- ИЗМЕНЕНИЕ 2: Запускаем трекер внутри управляемого JoinSet ---
                 tracking_tasks.spawn(async move {
                     track_order(request, client_clone, tx_clone, shutdown_clone, app_state_clone).await;
                 });
             },
-
-            // Ветка 2: Периодически очищаем JoinSet от уже завершившихся задач (когда ордер исполнился)
-            // Это необязательно для исправления бага, но является хорошей практикой для предотвращения утечек памяти.
-            Some(_) = tracking_tasks.join_next(), if !tracking_tasks.is_empty() => {},
-
-            // Ветка 3: Получаем сигнал о завершении работы
-            _ = shutdown.notified() => {
-                info!("[OrderWatcher] Shutdown signal received. Aborting all active order trackers.");
-                // --- ИЗМЕНЕНИЕ 3 (КЛЮЧЕВОЕ): Принудительно завершаем все дочерние задачи ---
-                tracking_tasks.abort_all();
-                break; // Выходим из главного цикла
+            Some(res) = tracking_tasks.join_next(), if !tracking_tasks.is_empty() => {
+                if let Err(e) = res {
+                    if !e.is_cancelled() {
+                        error!("[OrderWatcher] A tracking task failed: {:?}", e);
+                    }
+                }
             }
         }
     }
@@ -109,8 +107,12 @@ async fn track_order(
     let mut poll_interval = interval(Duration::from_millis(500)); // Опрашиваем каждые 500 мс
 
     loop {
-        // --- ИЗМЕНЕНИЕ: Используем select! для ожидания тика или shutdown ---
         tokio::select! {
+            biased;
+            _ = shutdown.notified() => {
+                info!("[OrderTracker] Shutdown signal received for order {}. Stopping tracking.", req.order_id);
+                break;
+            },
             _ = poll_interval.tick() => {
                 let check_result = match req.order_type {
                     OrderType::Spot => api_client.get_spot_order(&req.order_id).await,
@@ -158,22 +160,13 @@ async fn track_order(
 
 
                         // Отправляем событие в PositionManager через MPSC канал
-                        // --- ИЗМЕНЕНИЕ: Используем `send_cancellable` ---
                         if !send_cancellable(&order_filled_tx, filled_event, &shutdown).await {
                             error!("[OrderWatcher] Failed to send OrderFilledEvent for order {} to PositionManager (channel closed or shutdown).", &req.order_id);
                         }
                         
-                        // Завершаем отслеживание этого ордера
                         break;
                     }
                 }
-                // Если ордер еще не исполнен или произошла ошибка API (например, временная недоступность),
-                // мы просто продолжаем цикл и попробуем снова через 500 мс.
-                // Логирование здесь избыточно, т.к. это нормальное состояние.
-            },
-            _ = shutdown.notified() => {
-                info!("[OrderTracker] Shutdown signal received for order {}. Stopping tracking.", req.order_id);
-                break;
             }
         }
     }
