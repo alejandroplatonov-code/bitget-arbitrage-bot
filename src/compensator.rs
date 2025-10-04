@@ -2,13 +2,16 @@
 
 use crate::api_client::{ApiClient, PlaceFuturesOrderRequest, PlaceOrderRequest};
 use crate::state::AppState;
-use crate::types::{ArbitrageDirection, CompensationTask};
+use rust_decimal::prelude::FromPrimitive;
+use crate::types::{CompensationTask};
 use crate::order_watcher::OrderType;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
+
+const DUST_THRESHOLD_FACTOR: f64 = 0.9; // Считаем, что баланс/позиция отсутствует, если она меньше 90% от ожидаемой
 
 /// Runs the compensator service, which handles closing orphaned trade legs.
 /// It receives tasks and retries them indefinitely until they succeed.
@@ -72,41 +75,68 @@ async fn handle_compensation_task(
             .map(|r| *r.value())
             .unwrap_or_default();
 
-        let result: Result<_, _> = match (task.leg_to_compensate, task.original_direction) {
-            // --- СЦЕНАРИИ КОМПЕНСАЦИИ ДЛЯ ВХОДА (is_entry = true) ---
-            // Original was BuySpot, so we need to SellSpot to compensate.
-            (OrderType::Spot, ArbitrageDirection::BuySpotSellFutures) => {
-                let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
-                let qty = task.base_qty_to_compensate.trunc_with_scale(spot_quantity_scale);
-                let side = if task.is_entry { "sell" } else { "buy" }; // Если компенсируем выход, то покупаем спот
-                let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: side.to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: qty.to_string(), client_oid: None };
-                api_client.place_spot_order(req).await.map(|_| ())
+        let result = match task.leg_to_compensate {
+            // Спотовый ордер прошел, а фьючерсный - нет. Нужно компенсировать спот.
+            OrderType::Spot => {
+                let base_coin = task.symbol.replace("USDT", "");
+                match api_client.get_spot_balance(&base_coin).await {
+                    Ok(actual_balance) => {
+                        if actual_balance < task.base_qty_to_compensate * rust_decimal::Decimal::from_f64(DUST_THRESHOLD_FACTOR).unwrap() {
+                            warn!("[Compensator] CANCELLING task for {}. Spot balance ({}) is too low. Assumed already compensated.", task.symbol, actual_balance);
+                            return; // Выходим из функции, задача отменяется
+                        }
+
+                        let side = if task.is_entry { "sell" } else { "buy" };
+                        info!("[Compensator] Compensating SPOT leg for {}. Actual balance: {}. Placing {} order.", task.symbol, actual_balance, side.to_uppercase());
+                        let spot_scale = rules.spot_quantity_scale.unwrap_or(2);
+                        let sell_qty = actual_balance.trunc_with_scale(spot_scale);
+
+                        let req = PlaceOrderRequest { symbol: task.symbol.clone(), side: side.to_string(), order_type: "market".to_string(), force: "gtc".to_string(), size: sell_qty.to_string(), client_oid: None };
+                        api_client.place_spot_order(req).await.map(|_| ()).map_err(|e| e.into())
+                    }
+                    Err(e) => {
+                        error!("[Compensator] Could not get SPOT balance for {}: {:?}. Cannot verify compensation safety. Retrying...", task.symbol, e);
+                        Err(e)
+                    }
+                }
             },
-            // Original was SellFutures, so we need to BuyFutures to compensate.
-            (OrderType::Futures, ArbitrageDirection::BuySpotSellFutures) => {
-                let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4); // Фолбэк на 4
-                let qty = task.base_qty_to_compensate.trunc_with_scale(futures_quantity_scale);
-                let side = if task.is_entry { "buy" } else { "sell" }; // Если компенсируем выход, то продаем фьючерс
-                let req = PlaceFuturesOrderRequest {
-                    symbol: task.symbol.clone(),
-                    product_type: "USDT-FUTURES".to_string(),
-                    margin_mode: "isolated".to_string(),
-                    margin_coin: "USDT".to_string(),
-                    size: qty.to_string(),
-                    side: side.to_string(),
-                    trade_side: None,
-                    order_type: "market".to_string(),
-                    client_oid: None
-                };
-                api_client.place_futures_order(req).await.map(|_| ())
-            },
-            _ => Err(crate::error::AppError::LogicError("Unsupported compensation scenario".to_string())),
+            // Фьючерсный ордер прошел, а спотовый - нет. Нужно компенсировать фьючерс.
+            OrderType::Futures => {
+                match api_client.get_futures_position(&task.symbol).await {
+                    Ok(actual_position_size) => {
+                        if actual_position_size < task.base_qty_to_compensate * rust_decimal::Decimal::from_f64(DUST_THRESHOLD_FACTOR).unwrap() {
+                            warn!("[Compensator] CANCELLING task for {}. Futures position ({}) is too small. Assumed already compensated.", task.symbol, actual_position_size);
+                            return; // Выходим из функции, задача отменяется
+                        }
+
+                        let side = if task.is_entry { "buy" } else { "sell" };
+                        info!("[Compensator] Compensating FUTURES leg for {}. Actual position size: {}. Placing {} order to close.", task.symbol, actual_position_size, side.to_uppercase());
+                        let req = PlaceFuturesOrderRequest {
+                            symbol: task.symbol.clone(),
+                            product_type: "USDT-FUTURES".to_string(),
+                            margin_mode: "isolated".to_string(),
+                            margin_coin: "USDT".to_string(),
+                            size: actual_position_size.to_string(), // Закрываем фактический размер
+                            side: side.to_string(),
+                            trade_side: Some("close".to_string()),
+                            order_type: "market".to_string(),
+                            client_oid: None,
+                            price: None,
+                        };
+                        api_client.place_futures_order(req).await.map(|_| ()).map_err(|e| e.into())
+                    }
+                    Err(e) => {
+                        error!("[Compensator] Could not get FUTURES position for {}: {:?}. Cannot verify compensation safety. Retrying...", task.symbol, e);
+                        Err(e)
+                    }
+                }
+            }
         };
 
         match result {
             Ok(_) => {
                 info!("[Compensator] Successfully placed compensation order for {} (original order ID: {}). Task complete.", task.symbol, task.original_order_id);
-                return; // Exit the loop on success.
+                return; // Выходим из цикла и завершаем задачу
             }
             Err(e) => {
                 error!("[Compensator] Failed to place compensation order for {} (original order ID: {}): {:?}. Retrying in 5 seconds...", task.symbol, task.original_order_id, e);

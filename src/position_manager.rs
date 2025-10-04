@@ -66,6 +66,31 @@ async fn handle_entry_fill(
         OrderType::Futures => entry.1 = Some(event),
     }
 
+    // --- НОВАЯ ЛОГИКА: Maker-Taker ---
+    // Если пришел первый (Maker) ордер, немедленно отправляем второй (Taker)
+    if entry.0.is_none() && entry.1.is_some() { // Если есть фьючерс (Maker), но нет спота (Taker)
+        let futures_fill = entry.1.as_ref().unwrap();
+        info!("[PositionManager] Maker leg (FUTURES) for {} filled. Placing Taker leg (SPOT).", &futures_fill.symbol);
+
+        let taker_qty = Decimal::from_str(&futures_fill.base_volume).unwrap_or_default();
+        let client_oid = futures_fill.client_oid.clone();
+
+        // Запускаем отправку Taker-ордера в отдельной задаче
+        tokio::spawn({
+            let client = api_client.clone();
+            let symbol = futures_fill.symbol.clone();
+            async move {
+                let req = crate::api_client::PlaceOrderRequest {
+                    symbol, side: "buy".to_string(), order_type: "market".to_string(), force: "gtc".to_string(),
+                    size: taker_qty.to_string(), client_oid: Some(client_oid),
+                };
+                if let Err(e) = client.place_spot_order(req).await {
+                    error!("[PositionManager] CRITICAL: Failed to place Taker SPOT order for {}: {:?}", taker_qty, e);
+                }
+            }
+        });
+    }
+
     if let (Some(spot_fill), Some(futures_fill)) = (&entry.0, &entry.1) {
         info!("[PositionManager] Matched both ENTRY fills for clientOid {}. Opening position.", &spot_fill.client_oid);
 

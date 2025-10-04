@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 /// Runs the main trading algorithm loop.
 pub async fn run_trading_algorithm(
     app_state: Arc<AppState>,
-    config: Arc<Config>,
+    config: Arc<Config>, // Corrected type to Arc<Config>
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
     compensation_tx: mpsc::Sender<CompensationTask>,
@@ -184,7 +184,7 @@ async fn handle_open_position(
                     let fut_task = {
                         let req = PlaceFuturesOrderRequest {
                             symbol: symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(),
-                            margin_coin: "USDT".to_string(), size: futures_close_qty.to_string(), side: "buy".to_string(),
+                            margin_coin: "USDT".to_string(), size: futures_close_qty.to_string(), side: "buy".to_string(), price: None,
                             trade_side: None, order_type: "market".to_string(), client_oid: Some(client_oid.clone()),
                         };
                         client.place_futures_order(req)
@@ -194,9 +194,15 @@ async fn handle_open_position(
 
                     match (spot_res, fut_res) {
                         (Ok(spot_ord), Ok(fut_ord)) => {
-                            info!("[{}] CLOSE SUCCESS: Both close orders placed. Spot ID: {}, Futures ID: {}", &symbol, spot_ord.order_id, fut_ord.order_id);
-                            let spot_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_ord.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Exit };
-                            let fut_watch_req = WatchOrderRequest { symbol: symbol.clone(), order_id: fut_ord.order_id, order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Exit };
+                            info!("[{}] CLOSE SUCCESS: Both close orders placed. Spot ID: {}, Futures ID: {}", &symbol, &spot_ord.order_id, &fut_ord.order_id);
+                            let spot_watch_req = WatchOrderRequest {
+                                symbol: symbol.clone(), order_id: spot_ord.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(),
+                                context: crate::order_watcher::OrderContext::Exit, ..Default::default()
+                            };
+                            let fut_watch_req = WatchOrderRequest {
+                                symbol: symbol.clone(), order_id: fut_ord.order_id, order_type: OrderType::Futures, client_oid: client_oid,
+                                context: crate::order_watcher::OrderContext::Exit, ..Default::default()
+                            };
                             if !send_cancellable(&order_tx, spot_watch_req, &shutdown).await { error!("[{}] CRITICAL: Failed to send SPOT CLOSE watch request!", symbol); }
                             if !send_cancellable(&order_tx, fut_watch_req, &shutdown).await { error!("[{}] CRITICAL: Failed to send FUTURES CLOSE watch request!", symbol); }
                         },
@@ -336,15 +342,11 @@ fn check_and_execute_arbitrage(
                 s_levels = format_levels_from_details(&buy_spot_res.levels_consumed)
             );
 
-            let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
-            let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
-            let rounded_futures_qty = base_qty_n.trunc_with_scale(fut_scale);
-
             if config.live_trading_enabled {
-                tokio::spawn(execute_entry_trade_task(
+                // --- ИСПРАВЛЕНИЕ: Вызываем новую функцию Maker-Taker ---
+                tokio::spawn(execute_maker_taker_entry_task(
                     symbol.to_string(),
-                    buy_spot_res.total_quote_qty,
-                    rounded_futures_qty,
+                    base_qty_n, // Передаем базовое количество
                     client_oid,
                     app_state,
                     config,
@@ -360,96 +362,109 @@ fn check_and_execute_arbitrage(
     }
 }
 
-async fn execute_entry_trade_task(
+async fn execute_maker_taker_entry_task(
     symbol: String,
-    cost_spot_entry: Decimal,
-    rounded_futures_qty: Decimal,
+    base_qty: Decimal,
     client_oid: String,
     app_state: Arc<AppState>,
     config: Arc<Config>,
     api_client: Arc<ApiClient>,
     order_watch_tx: mpsc::Sender<WatchOrderRequest>,
-    compensation_tx: mpsc::Sender<CompensationTask>,
+    _compensation_tx: mpsc::Sender<CompensationTask>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
-    let cost_with_slippage = cost_spot_entry * (Decimal::ONE + config.spot_slippage_buffer_percent / Decimal::from(100));
-    const GLOBAL_PRICE_SCALE: u32 = 4;
-    let rounded_spot_cost = cost_with_slippage.trunc_with_scale(GLOBAL_PRICE_SCALE);
+    let mut last_chase_time = Instant::now();
+    let chase_throttle = Duration::from_millis(500); // Не чаще чем раз в 500 мс
+    let mut current_maker_order_id: Option<String> = None;
 
-    // --- ИЗМЕНЕНИЕ: Делаем снимок T2 ---
-    if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
-        if let Some(pair_data) = app_state.inner.market_data.get(&symbol) {
-            let snapshot_t2 = MarketSnapshot {
-                timestamp: Utc::now().timestamp_millis(),
-                futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
-                spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
-            };
-            analysis_log_entry.value_mut().snapshot_before_send = snapshot_t2;
-        }
-    }
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.notified() => {
+                info!("[MakerTaker] Shutdown signal received for {}. Cancelling active maker order if any.", symbol);
+                if current_maker_order_id.is_some() {
+                    let _ = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await;
+                }
+                break;
+            },
+            _ = tokio::time::sleep(chase_throttle) => {
+                if last_chase_time.elapsed() < chase_throttle { continue; }
+                last_chase_time = Instant::now();
 
-    let (spot_res, fut_res) = tokio::join!(
-        async {
-            let order = PlaceOrderRequest {
-                symbol: symbol.clone(), side: "buy".to_string(), order_type: "market".to_string(),
-                force: "gtc".to_string(), size: rounded_spot_cost.to_string(), client_oid: Some(client_oid.clone()),
-            };
-            info!("[{}] SPOT ORDER REQUEST BODY: {}", symbol, serde_json::to_string(&order).unwrap_or_default());
-            api_client.place_spot_order(order).await
-        },
-        async {
-            let order = PlaceFuturesOrderRequest {
-                symbol: symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(),
-                margin_coin: "USDT".to_string(), size: rounded_futures_qty.to_string(), side: "sell".to_string(),
-                trade_side: None, order_type: "market".to_string(), client_oid: Some(client_oid.clone()),
-            };
-            info!("[{}] FUTURES ORDER REQUEST BODY: {}", symbol, serde_json::to_string(&order).unwrap_or_default());
-            api_client.place_futures_order(order).await
-        }
-    );
+                // Проверяем, не создалась ли уже позиция (т.е. ордер исполнился)
+                if app_state.inner.active_positions.contains_key(&symbol) {
+                    info!("[MakerTaker] Position for {} is now active. Stopping price chase.", symbol);
+                    break;
+                }
 
-    match (spot_res, fut_res) {
-        (Ok(spot_order), Ok(futures_order)) => {
-            info!("[{}] ENTRY SUCCESS: Both entry orders placed. Spot ID: {}, Futures ID: {}", &symbol, &spot_order.order_id, &futures_order.order_id);
+                let pair_data = match app_state.inner.market_data.get(&symbol) {
+                    Some(pd) => pd,
+                    None => continue,
+                };
 
-            // --- НАЧАЛО НОВОГО БЛОКА: ДЕЛАЕМ СНИМОК T3 ---
-            if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
-                if let Some(pair_data) = app_state.inner.market_data.get(&symbol) {
-                    let snapshot_t3 = MarketSnapshot {
-                        timestamp: Utc::now().timestamp_millis(),
-                        futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
-                        spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
-                    };
-                    analysis_log_entry.value_mut().snapshot_at_acceptance = snapshot_t3;
+                // Целевая цена для Maker-ордера
+                let target_price = match pair_data.spot_book.asks.iter().next() {
+                    Some((price, _)) => *price * (Decimal::ONE + config.spread_threshold_percent / Decimal::from(100)),
+                    None => continue,
+                };
+
+                // Отменяем предыдущий ордер, если он был
+                if let Some(ref order_id) = current_maker_order_id {
+                    info!("[MakerTaker] Chasing price for {}. Cancelling previous order {}", symbol, order_id);
+                    if let Err(e) = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await {
+                        warn!("[MakerTaker] Failed to cancel previous maker order for {}: {:?}. May resolve on its own.", symbol, e);
+                    }
+                }
+
+                // Размещаем новый лимитный ордер
+                let rules = app_state.inner.symbol_rules.get(&symbol).map(|r| *r.value()).unwrap_or_default();
+                let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
+                let rounded_qty = base_qty.trunc_with_scale(fut_scale);
+
+                let req = PlaceFuturesOrderRequest {
+                    symbol: symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(),
+                    margin_coin: "USDT".to_string(), size: rounded_qty.to_string(), side: "sell".to_string(),
+                    trade_side: None, order_type: "limit".to_string(), client_oid: Some(client_oid.clone()),
+                    price: Some(target_price.to_string()),
+                };
+
+                match api_client.place_futures_order(req).await {
+                    Ok(order) => {
+                        info!("[MakerTaker] Placed new MAKER order for {}: ID {}, Price {}", symbol, order.order_id, target_price);
+                        current_maker_order_id = Some(order.order_id.clone());
+
+                        // Обновляем "черный ящик"
+                        if let Some(mut log) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
+                            log.maker_order_id = current_maker_order_id.clone();
+                        }
+
+                        // Отправляем на отслеживание
+                        let watch_req = WatchOrderRequest {
+                            symbol: symbol.clone(),
+                            order_id: order.order_id,
+                            order_type: OrderType::Futures,
+                            client_oid: client_oid.clone(),
+                            maker_price: Some(target_price),
+                            context: crate::order_watcher::OrderContext::Entry,
+                        };
+                        if !send_cancellable(&order_watch_tx, watch_req, &shutdown).await {
+                            error!("[MakerTaker] CRITICAL: Failed to send MAKER watch request for {}", symbol);
+                            // В случае сбоя, отменяем только что созданный ордер
+                            let _ = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await;
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        error!("[MakerTaker] Failed to place new MAKER order for {}: {:?}", symbol, e);
+                        // Если не удалось разместить, попробуем в следующей итерации
+                        current_maker_order_id = None;
+                    }
                 }
             }
-
-            let spot_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_order.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Entry };
-            let fut_req = WatchOrderRequest { symbol: symbol.clone(), order_id: futures_order.order_id, order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Entry };
-            if !send_cancellable(&order_watch_tx, spot_req, &shutdown).await { error!("[{}] Failed to send spot watch request", symbol); }
-            if !send_cancellable(&order_watch_tx, fut_req, &shutdown).await { error!("[{}] Failed to send futures watch request", symbol); app_state.inner.executing_pairs.remove(&symbol); }
-        },
-        (Ok(spot_order), Err(e_fut)) => {
-            error!("[{}] LEGGING RISK ON ENTRY (Futures Failed): {:?}. Delegating to compensator.", symbol, e_fut);
-            let task = CompensationTask {
-                symbol: symbol.clone(), original_order_id: spot_order.order_id, base_qty_to_compensate: rounded_futures_qty,
-                original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot, is_entry: true,
-            };
-            if !send_cancellable(&compensation_tx, task, &shutdown).await { error!("[{}] CRITICAL: Failed to send compensation task for SPOT leg!", symbol); }
-            app_state.inner.executing_pairs.remove(&symbol);
-        },
-        (Err(e_spot), Ok(futures_order)) => {
-            error!("[{}] LEGGING RISK ON ENTRY (Spot Failed): {:?}. Delegating to compensator.", symbol, e_spot);
-            let task = CompensationTask {
-                symbol: symbol.clone(), original_order_id: futures_order.order_id, base_qty_to_compensate: rounded_futures_qty,
-                original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures, is_entry: true,
-            };
-            if !send_cancellable(&compensation_tx, task, &shutdown).await { error!("[{}] CRITICAL: Failed to send compensation task for FUTURES leg!", symbol); }
-            app_state.inner.executing_pairs.remove(&symbol);
-        },
-        (Err(e_spot), Err(e_fut)) => {
-             error!("[{}] FAILED to place both entry orders. Spot: {:?}, Futures: {:?}. Releasing lock.", symbol, e_spot, e_fut);
-             app_state.inner.executing_pairs.remove(&symbol);
-        },
+        }
     }
+
+    // Если мы вышли из цикла (успех или shutdown), снимаем блокировку
+    info!("[MakerTaker] Task for {} finished.", symbol);
+    app_state.inner.executing_pairs.remove(&symbol);
 }

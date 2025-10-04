@@ -17,26 +17,29 @@ use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 /// Контекст ордера: для входа в позицию или для выхода.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum OrderContext {
+    #[default]
     Entry,
     Exit,
 }
 
 /// Типы ордеров, которые мы можем отслеживать.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum OrderType {
+    #[default]
     Spot,
     Futures,
 }
 
 /// Сообщение, которое `algorithm` отправляет в `order_watcher`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WatchOrderRequest {
     pub symbol: String,
     pub order_id: String,
     pub order_type: OrderType,
     pub client_oid: String,
+    pub maker_price: Option<Decimal>, // Для Maker-ордеров
     pub context: OrderContext,
 }
 
@@ -193,7 +196,19 @@ async fn track_order(
                         }
                         
                         break;
+                    } else if order_info.status == "partially_filled" {
+                        // TODO: Handle partially filled orders if needed for the strategy.
+                        // For now, we just log and continue polling.
+                        info!("[OrderTracker] Order {} for {} is PARTIALLY_FILLED. Continuing to track.", &req.order_id, &req.symbol);
+                    } else if order_info.status == "cancelled" {
+                        info!("[OrderTracker] Order {} for {} was CANCELLED. Stopping tracking.", &req.order_id, &req.symbol);
+                        break;
                     }
+                } else {
+                    // If the order is not found, it might have been cancelled and removed from the exchange's history quickly.
+                    // Or there could be a temporary API issue. We'll log a warning and stop tracking to avoid an infinite loop.
+                    warn!("[OrderTracker] Failed to get order info for {}. It might have been cancelled. Stopping tracking.", req.order_id);
+                    break;
                 }
             }
         }
@@ -295,14 +310,14 @@ fn generate_final_report(log: &TradeAnalysisLog) {
         }
     }
 
-    let sim_pnl = sim_fut_rev - sim_spot_cost;
-    let actual_pnl = futures_revenue - spot_cost;
-    let slippage = actual_pnl - sim_pnl;
+    let sim_entry_spread_usdt = sim_fut_rev - sim_spot_cost;
+    let actual_entry_spread_usdt = futures_revenue - spot_cost;
+    let slippage = actual_entry_spread_usdt - sim_entry_spread_usdt;
 
     report.push_str("\n--- ANALYSIS ---\n");
-    report.push_str(&format!("- Simulated PnL: {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", sim_pnl, sim_fut_rev, sim_spot_cost));
-    report.push_str(&format!("- Actual PnL:    {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", actual_pnl, futures_revenue, spot_cost));
-    report.push_str(&format!("- Slippage:      {:.4} USDT\n", slippage));
+    report.push_str(&format!("- Simulated Entry Spread: {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", sim_entry_spread_usdt, sim_fut_rev, sim_spot_cost));
+    report.push_str(&format!("- Actual Entry Spread:    {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", actual_entry_spread_usdt, futures_revenue, spot_cost));
+    report.push_str(&format!("- Slippage on Entry:      {:.4} USDT\n", slippage));
     if slippage < Decimal::ZERO {
         report.push_str("- Diagnosis: Negative slippage indicates that the market moved against the trade between decision and execution.\n");
     }

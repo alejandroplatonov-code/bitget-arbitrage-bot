@@ -45,6 +45,9 @@ pub struct PlaceFuturesOrderRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_oid: Option<String>,
+    // --- ИСПРАВЛЕНИЕ: Добавляем поле для цены лимитного ордера ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
 }
 
 /// Structure for the data field in a successful order placement response.
@@ -278,10 +281,6 @@ impl ApiClient {
     ) -> Result<PlaceOrderResponse, AppError> {
         let path = "/api/v2/mix/order/place-order";
 
-        if order.order_type != "market" {
-            return Err(AppError::LogicError("Only market orders are supported".to_string()));
-        }
-
         let builder = self.create_signed_request(Method::POST, path, None, order)?;
         let response = builder.send().await?;
         let api_response: ApiResponse<PlaceOrderResponse> = response.json().await?;
@@ -441,6 +440,26 @@ impl ApiClient {
                 Err(AppError::ApiError(api_response.code, api_response.msg))
             }
         }
+    }
+
+    // --- НОВАЯ ФУНКЦИЯ ---
+    /// Cancels all open futures orders for a symbol with a specific clientOid.
+    pub async fn cancel_futures_order_by_client_oid(&self, symbol: &str, client_oid: &str) -> Result<(), AppError> {
+        let path = "/api/v2/mix/order/cancel-batch-orders";
+        
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CancelRequest {
+            product_type: String,
+            client_oids: Vec<String>,
+        }
+        let body = CancelRequest { product_type: format!("{}-FUTURES", symbol.replace("USDT", "")), client_oids: vec![client_oid.to_string()] };
+
+        let builder = self.create_signed_request(Method::POST, path, None, body)?;
+        let response = builder.send().await?;
+        let api_response: ApiResponse<serde_json::Value> = response.json().await?;
+
+        if api_response.code == "00000" { Ok(()) } else { Err(AppError::ApiError(api_response.code, api_response.msg)) }
     }
 
     /// Sets the position mode for futures.
