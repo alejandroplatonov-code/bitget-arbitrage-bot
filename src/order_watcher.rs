@@ -1,6 +1,6 @@
 // src/order_watcher.rs
 
-use crate::state::AppState;
+use crate::{state::AppState, types::MarketSnapshot};
 use crate::types::TradeAnalysisLog;
 use crate::api_client::ApiClient;
 use rust_decimal::Decimal;
@@ -139,16 +139,41 @@ async fn track_order(
                         // --- Шаг 1: Запись данных T4 ---
                         // Мы делаем это только для ордеров на вход, так как "черный ящик" создается только для них.
                         if req.context == OrderContext::Entry { // Убеждаемся, что это ордер на вход
-                            if let Some(log_entry) = app_state.inner.trade_analysis_logs.get(&req.client_oid) { // Находим лог по clientOid
-                                let quote_vol_str = order_info.quote_volume.as_deref().unwrap_or("0");
-                                // Определяем, была ли это "стоимость" (покупка на споте) или "выручка" (продажа на фьючерсах)
-                                let vol_label = if req.order_type == OrderType::Spot { "Cost" } else { "Revenue" };
-                                let execution_details = format!(
-                                    "Filled: {} @ {} | {}: {}",
-                                    order_info.base_volume, order_info.price_avg, vol_label, quote_vol_str
-                                );
+                            // --- НАЧАЛО НОВОГО БЛОКА: ДЕЛАЕМ СНИМОК T4 ---
+                            let mut snapshot_t4 = MarketSnapshot::default();
+                            if let Some(pair_data) = app_state.inner.market_data.get(&req.symbol) {
+                                // Используем функцию из algorithm.rs для форматирования.
+                                // Примечание: в идеале эта функция должна быть в utils.
+                                let bids_str = crate::algorithm::format_levels_for_analysis(&pair_data.futures_book.bids, true, 5);
+                                let asks_str = crate::algorithm::format_levels_for_analysis(&pair_data.spot_book.asks, false, 5);
+                                snapshot_t4.timestamp = execution_time;
+                                snapshot_t4.futures_bids = bids_str;
+                                snapshot_t4.spot_asks = asks_str;
+                            }
+
+                            if let Some(log_entry) = app_state.inner.trade_analysis_logs.get(&req.client_oid) {
+                                let execution_details = match req.order_type {
+                                    OrderType::Spot => {
+                                        // Для спота используем quote_volume, это и есть стоимость (Cost).
+                                        let cost_str = order_info.quote_volume.as_deref().unwrap_or("0");
+                                        format!(
+                                            "Filled: {} @ {} | Cost: {}",
+                                            order_info.base_volume, order_info.price_avg, cost_str
+                                        )
+                                    },
+                                    OrderType::Futures => {
+                                        // Для фьючерсов ВЫЧИСЛЯЕМ выручку (Revenue), т.к. quote_volume ненадежен.
+                                        let price = Decimal::from_str(&order_info.price_avg).unwrap_or_default();
+                                        let qty = Decimal::from_str(&order_info.base_volume).unwrap_or_default();
+                                        let revenue = price * qty;
+                                        format!(
+                                            "Filled: {} @ {} | Revenue: {:.4}",
+                                            order_info.base_volume, order_info.price_avg, revenue
+                                        )
+                                    }
+                                };
                                 // Записываем детали исполнения в лог
-                                log_entry.execution_logs.insert(req.order_id.clone(), (execution_time, execution_details));
+                                log_entry.execution_logs.insert(req.order_id.clone(), (execution_time, execution_details.clone(), snapshot_t4));
 
                                 // --- Шаг 2: Проверка на завершение ---
                                 if log_entry.execution_logs.len() >= 2 { // Если оба ордера (спот и фьючерс) исполнены
@@ -181,10 +206,10 @@ fn generate_final_report(log: &TradeAnalysisLog) {
 
     let t1_dt = chrono::DateTime::from_timestamp_millis(log.snapshot_at_decision.timestamp).unwrap().with_timezone(&Local);
     let t2_dt = chrono::DateTime::from_timestamp_millis(log.snapshot_before_send.timestamp).unwrap().with_timezone(&Local);
-    let t3_dt = chrono::DateTime::from_timestamp_millis(log.timestamp_accepted).unwrap().with_timezone(&Local);
+    let t3_dt = chrono::DateTime::from_timestamp_millis(log.snapshot_at_acceptance.timestamp).unwrap().with_timezone(&Local);
 
     let t2_delay = log.snapshot_before_send.timestamp - log.snapshot_at_decision.timestamp;
-    let t3_delay = log.timestamp_accepted - log.snapshot_at_decision.timestamp;
+    let t3_delay = log.snapshot_at_acceptance.timestamp - log.snapshot_at_decision.timestamp;
 
     report.push_str(&format!(
         "\n--- TRADE ANALYSIS [{}] clientOid: {} ---\n",
@@ -209,10 +234,12 @@ fn generate_final_report(log: &TradeAnalysisLog) {
     report.push_str(&format!("      └─ Spot Asks:    {}\n\n", log.snapshot_before_send.spot_asks));
 
     report.push_str(&format!(
-        "[T3: ACCEPTED by Exchange @ {}]\n",
-        t3_dt.format("%H:%M:%S%.3f")
+        "[T3: ACCEPTED by Exchange @ {} (+{}ms)]\n",
+        t3_dt.format("%H:%M:%S%.3f"), t3_delay
     ));
-    report.push_str(&format!("  └─ Time from Decision to Acceptance: {}ms\n\n", t3_delay));
+    report.push_str("  └─ Market State:\n");
+    report.push_str(&format!("      ├─ Futures Bids: {}\n", log.snapshot_at_acceptance.futures_bids));
+    report.push_str(&format!("      └─ Spot Asks:    {}\n\n", log.snapshot_at_acceptance.spot_asks));
 
     report.push_str("[T4: EXECUTION]\n");
 
@@ -221,9 +248,9 @@ fn generate_final_report(log: &TradeAnalysisLog) {
 
     for leg in log.execution_logs.iter() {
         let order_id = leg.key();
-        let (exec_time, details) = leg.value();
-        let exec_dt = chrono::DateTime::from_timestamp_millis(*exec_time).unwrap().with_timezone(&Local);
-        let exec_delay = *exec_time - log.timestamp_accepted;
+        let (exec_time, details, snapshot_t4) = leg.value();
+        let exec_dt = chrono::DateTime::from_timestamp_millis(*exec_time).unwrap().with_timezone(&Local); // No change needed here
+        let exec_delay = *exec_time - log.snapshot_at_acceptance.timestamp;
 
         // Пытаемся определить тип лега по деталям
         let leg_type = if details.contains("Cost") { "SPOT" } else if details.contains("Revenue") { "FUTURES" } else { "UNKNOWN" };
@@ -234,20 +261,24 @@ fn generate_final_report(log: &TradeAnalysisLog) {
             &order_id[..8]
         ));
         report.push_str(&format!(
-            "  │   └─ Executed @ {} (Delay: {}ms) | {}\n",
+            "  │   ├─ Executed @ {} (Delay: {}ms) | {}\n",
             exec_dt.format("%H:%M:%S%.3f"),
             exec_delay,
             details
         ));
+        report.push_str("  │   └─ Market State @ Execution:\n");
+        report.push_str(&format!("  │       ├─ Futures Bids: {}\n", snapshot_t4.futures_bids));
+        report.push_str(&format!("  │       └─ Spot Asks:    {}\n", snapshot_t4.spot_asks));
+
 
         // Для финального анализа
         if leg_type == "SPOT" {
-            if let Some(cost_str) = details.split("Cost: ").last() {
-                spot_cost = Decimal::from_str(cost_str).unwrap_or_default();
+            if let Some(cost_str) = details.split("Cost: ").last().and_then(|s| s.split_whitespace().next()) {
+                spot_cost = Decimal::from_str(cost_str.trim()).unwrap_or_default();
             }
         } else if leg_type == "FUTURES" {
-            if let Some(rev_str) = details.split("Revenue: ").last() {
-                futures_revenue = Decimal::from_str(rev_str).unwrap_or_default();
+            if let Some(rev_str) = details.split("Revenue: ").last().and_then(|s| s.split_whitespace().next()) {
+                futures_revenue = Decimal::from_str(rev_str.trim()).unwrap_or_default();
             }
         }
     }

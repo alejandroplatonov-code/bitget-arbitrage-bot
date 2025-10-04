@@ -239,7 +239,7 @@ async fn handle_unopened_pair(
 }
 
 // --- ИЗМЕНЕНИЕ: Новая универсальная функция-хелпер ---
-fn format_levels_for_analysis(book: &BTreeMap<Decimal, Decimal>, reverse: bool, limit: usize) -> String {
+pub fn format_levels_for_analysis(book: &BTreeMap<Decimal, Decimal>, reverse: bool, limit: usize) -> String {
     let mut items = Vec::new();
     if reverse {
         for (p, q) in book.iter().rev().take(limit) {
@@ -411,10 +411,17 @@ async fn execute_entry_trade_task(
     match (spot_res, fut_res) {
         (Ok(spot_order), Ok(futures_order)) => {
             info!("[{}] ENTRY SUCCESS: Both entry orders placed. Spot ID: {}, Futures ID: {}", &symbol, &spot_order.order_id, &futures_order.order_id);
-            
-            // --- ИЗМЕНЕНИЕ: Записываем время T3 ---
+
+            // --- НАЧАЛО НОВОГО БЛОКА: ДЕЛАЕМ СНИМОК T3 ---
             if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
-                analysis_log_entry.value_mut().timestamp_accepted = Utc::now().timestamp_millis();
+                if let Some(pair_data) = app_state.inner.market_data.get(&symbol) {
+                    let snapshot_t3 = MarketSnapshot {
+                        timestamp: Utc::now().timestamp_millis(),
+                        futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
+                        spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
+                    };
+                    analysis_log_entry.value_mut().snapshot_at_acceptance = snapshot_t3;
+                }
             }
 
             let spot_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_order.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Entry };

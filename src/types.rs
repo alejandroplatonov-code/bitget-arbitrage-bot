@@ -186,10 +186,10 @@ pub struct TradeAnalysisLog {
     pub simulation_log: String, // Лог из ENTRY TRIGGERED
     pub snapshot_at_decision: MarketSnapshot, // T1
     pub snapshot_before_send: MarketSnapshot, // T2
-    pub timestamp_accepted: i64, // T3 (время из ENTRY SUCCESS)
-    // Ключ - orderId, значение - (время T4, реальное исполнение)
+    pub snapshot_at_acceptance: MarketSnapshot, // T3
+    // Ключ - orderId, значение - (время T4, реальное исполнение, снимок T4)
     #[serde(skip, default = "default_execution_logs")]
-    pub execution_logs: Arc<dashmap::DashMap<String, (i64, String)>>,
+    pub execution_logs: Arc<dashmap::DashMap<String, (i64, String, MarketSnapshot)>>,
 }
 
 impl Default for TradeAnalysisLog {
@@ -200,13 +200,13 @@ impl Default for TradeAnalysisLog {
             simulation_log: String::new(),
             snapshot_at_decision: Default::default(),
             snapshot_before_send: Default::default(),
-            timestamp_accepted: 0,
+            snapshot_at_acceptance: Default::default(),
             execution_logs: default_execution_logs(),
         }
     }
 }
 
 /// Helper function to provide a default value for the skipped field.
-fn default_execution_logs() -> Arc<dashmap::DashMap<String, (i64, String)>> {
+fn default_execution_logs() -> Arc<dashmap::DashMap<String, (i64, String, MarketSnapshot)>> {
     Arc::new(dashmap::DashMap::new())
 }
