@@ -373,6 +373,11 @@ async fn execute_maker_taker_entry_task(
     _compensation_tx: mpsc::Sender<CompensationTask>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
+    info!("[MakerTaker] Task started for {}.", symbol);
+
+    // Таймер, который запускается только когда спред становится невыгодным.
+    let mut unfavorable_spread_timer: Option<Instant> = None;
+    let task_timeout = Duration::from_secs(120); // Таймаут в 2 минуты
     let mut last_chase_time = Instant::now();
     let chase_throttle = Duration::from_millis(500); // Не чаще чем раз в 500 мс
     let mut current_maker_order_id: Option<String> = None;
@@ -383,9 +388,11 @@ async fn execute_maker_taker_entry_task(
             _ = shutdown.notified() => {
                 info!("[MakerTaker] Shutdown signal received for {}. Cancelling active maker order if any.", symbol);
                 if current_maker_order_id.is_some() {
-                    let _ = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await;
+                    if let Err(e) = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await {
+                        warn!("[MakerTaker] Failed to cancel maker order on shutdown for {}: {:?}", symbol, e);
+                    }
                 }
-                break;
+                break; // Выходим из цикла при завершении работы
             },
             _ = tokio::time::sleep(chase_throttle) => {
                 if last_chase_time.elapsed() < chase_throttle { continue; }
@@ -394,13 +401,43 @@ async fn execute_maker_taker_entry_task(
                 // Проверяем, не создалась ли уже позиция (т.е. ордер исполнился)
                 if app_state.inner.active_positions.contains_key(&symbol) {
                     info!("[MakerTaker] Position for {} is now active. Stopping price chase.", symbol);
-                    break;
+                    break; // Успех, выходим из цикла
                 }
 
                 let pair_data = match app_state.inner.market_data.get(&symbol) {
                     Some(pd) => pd,
                     None => continue,
                 };
+
+                // Рассчитываем текущий спред для принятия решения о таймауте
+                let current_spread = if let (Some(sell_res), Some(buy_res)) = (
+                    trading_logic::calculate_revenue_from_sale(&pair_data.futures_book.bids, base_qty),
+                    trading_logic::calculate_cost_to_acquire(&pair_data.spot_book.asks, base_qty),
+                ) {
+                    if !buy_res.total_quote_qty.is_zero() {
+                        ((sell_res.total_quote_qty - buy_res.total_quote_qty) / buy_res.total_quote_qty) * Decimal::from(100)
+                    } else { Decimal::ZERO }
+                } else { Decimal::ZERO };
+
+                if current_spread < config.spread_threshold_percent {
+                    // Спред невыгодный, запускаем или проверяем таймер
+                    let timer = unfavorable_spread_timer.get_or_insert_with(Instant::now);
+                    if timer.elapsed() >= task_timeout {
+                        info!("[MakerTaker] Task for {} timed out. Spread has been unfavorable for over {} seconds. Current spread: {:.4}%. Cancelling chase.", symbol, task_timeout.as_secs(), current_spread);
+                        if current_maker_order_id.is_some() {
+                            if let Err(e) = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await {
+                                warn!("[MakerTaker] Failed to cancel maker order on timeout for {}: {:?}", symbol, e);
+                            }
+                        }
+                        break; // Выходим из цикла по таймауту
+                    }
+                } else {
+                    // Спред снова стал выгодным, сбрасываем таймер
+                    if unfavorable_spread_timer.is_some() {
+                        info!("[MakerTaker] Spread for {} is favorable again ({:.4}%). Resetting timeout.", symbol, current_spread);
+                        unfavorable_spread_timer = None;
+                    }
+                }
 
                 // Целевая цена для Maker-ордера
                 let target_price = match pair_data.spot_book.asks.iter().next() {
@@ -460,6 +497,6 @@ async fn execute_maker_taker_entry_task(
     }
 
     // Если мы вышли из цикла (успех или shutdown), снимаем блокировку
-    info!("[MakerTaker] Task for {} finished.", symbol);
+    info!("[MakerTaker] Task for {} finished. Releasing execution lock.", symbol);
     app_state.inner.executing_pairs.remove(&symbol);
 }
