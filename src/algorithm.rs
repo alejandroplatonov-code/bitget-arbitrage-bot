@@ -433,18 +433,13 @@ async fn execute_maker_taker_entry_task(
                         info!("[MakerTaker] Placed new MAKER order for {}: ID {}, Price {}", symbol, order.order_id, target_price);
                         current_maker_order_id = Some(order.order_id.clone());
 
-                        // Обновляем "черный ящик"
-                        if let Some(mut log) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
-                            log.maker_order_id = current_maker_order_id.clone();
-                        }
-
                         // Отправляем на отслеживание
                         let watch_req = WatchOrderRequest {
                             symbol: symbol.clone(),
                             order_id: order.order_id,
                             order_type: OrderType::Futures,
                             client_oid: client_oid.clone(),
-                            maker_price: Some(target_price),
+                            is_maker: true,
                             context: crate::order_watcher::OrderContext::Entry,
                         };
                         if !send_cancellable(&order_watch_tx, watch_req, &shutdown).await {

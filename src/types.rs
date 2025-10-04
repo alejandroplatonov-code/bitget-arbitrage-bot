@@ -187,7 +187,6 @@ pub struct TradeAnalysisLog {
     pub snapshot_at_decision: MarketSnapshot, // T1
     pub snapshot_before_send: MarketSnapshot, // T2
     pub snapshot_at_acceptance: MarketSnapshot, // T3
-    pub maker_order_id: Option<String>, // ID "якорного" Maker-ордера
     // Ключ - orderId, значение - (время T4, реальное исполнение, снимок T4)
     #[serde(skip, default = "default_execution_logs")]
     pub execution_logs: Arc<dashmap::DashMap<String, (i64, String, MarketSnapshot)>>,
@@ -202,7 +201,6 @@ impl Default for TradeAnalysisLog {
             snapshot_at_decision: Default::default(),
             snapshot_before_send: Default::default(),
             snapshot_at_acceptance: Default::default(),
-            maker_order_id: None,
             execution_logs: default_execution_logs(),
         }
     }

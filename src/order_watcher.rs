@@ -1,22 +1,21 @@
 // src/order_watcher.rs
 
-use crate::{state::AppState, types::MarketSnapshot};
-use crate::types::TradeAnalysisLog;
-use crate::api_client::ApiClient;
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use crate::api_client::{ApiClient, PlaceOrderRequest};
+use crate::state::AppState;
+use crate::types::MarketSnapshot;
 use crate::utils::send_cancellable;
-use chrono::Local;
-use std::str::FromStr;
+use chrono::{Local, TimeZone, Utc};
+use rust_decimal::{dec, Decimal};
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
-use tokio::task::JoinSet;
-use std::sync::{Arc};
+use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-/// Контекст ордера: для входа в позицию или для выхода.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum OrderContext {
     #[default]
@@ -24,7 +23,6 @@ pub enum OrderContext {
     Exit,
 }
 
-/// Типы ордеров, которые мы можем отслеживать.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum OrderType {
     #[default]
@@ -32,18 +30,16 @@ pub enum OrderType {
     Futures,
 }
 
-/// Сообщение, которое `algorithm` отправляет в `order_watcher`.
 #[derive(Debug, Clone, Default)]
 pub struct WatchOrderRequest {
     pub symbol: String,
     pub order_id: String,
     pub order_type: OrderType,
     pub client_oid: String,
-    pub maker_price: Option<Decimal>, // Для Maker-ордеров
+    pub is_maker: bool,
     pub context: OrderContext,
 }
 
-/// Событие, которое `order_watcher` публикует в Redis при исполнении ордера.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OrderFilledEvent {
     pub symbol: String,
@@ -51,22 +47,19 @@ pub struct OrderFilledEvent {
     pub order_type: OrderType,
     pub avg_price: String,
     pub base_volume: String,
-    pub quote_volume: Option<String>, // Только для спота
+    pub quote_volume: Option<String>,
     pub client_oid: String,
     pub context: OrderContext,
 }
 
-/// Запускает главный цикл "смотрителя ордеров".
-/// Он принимает запросы на отслеживание и для каждого запускает отдельную задачу-трекер.
 pub async fn run_order_watcher(
     mut order_rx: mpsc::Receiver<WatchOrderRequest>,
     api_client: Arc<ApiClient>,
-    order_filled_tx: mpsc::Sender<OrderFilledEvent>, // <-- ИЗМЕНЕНИЕ: Принимаем MPSC Sender
-    _app_state: Arc<AppState>,
+    order_filled_tx: mpsc::Sender<OrderFilledEvent>,
+    app_state: Arc<AppState>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     info!("[OrderWatcher] Service started.");
-
     let mut tracking_tasks = JoinSet::new();
 
     loop {
@@ -79,12 +72,14 @@ pub async fn run_order_watcher(
             },
             Some(request) = order_rx.recv() => {
                 info!("[OrderWatcher] Received request to watch order ID: {} (clientOid: {})", request.order_id, request.client_oid);
-                let client_clone = api_client.clone();
-                let tx_clone = order_filled_tx.clone();
-                let shutdown_clone = shutdown.clone();
-                let app_state_clone = _app_state.clone();
-                tracking_tasks.spawn(async move {
-                    track_order(request, client_clone, tx_clone, shutdown_clone, app_state_clone).await;
+                tracking_tasks.spawn({
+                    let client = api_client.clone();
+                    let filled_tx = order_filled_tx.clone();
+                    let shutdown = shutdown.clone();
+                    let app_state = app_state.clone();
+                    async move {
+                        track_order(request, client, filled_tx, shutdown, app_state).await;
+                    }
                 });
             },
             Some(res) = tracking_tasks.join_next(), if !tracking_tasks.is_empty() => {
@@ -99,15 +94,14 @@ pub async fn run_order_watcher(
     warn!("[OrderWatcher] Service is shutting down.");
 }
 
-/// Отслеживает один конкретный ордер до его исполнения или отмены.
 async fn track_order(
     req: WatchOrderRequest,
     api_client: Arc<ApiClient>,
-    order_filled_tx: mpsc::Sender<OrderFilledEvent>, // <-- ИЗМЕНЕНИЕ: Принимаем MPSC Sender
-    shutdown: Arc<tokio::sync::Notify>, // <-- Добавлен аргумент
+    order_filled_tx: mpsc::Sender<OrderFilledEvent>,
+    shutdown: Arc<tokio::sync::Notify>,
     app_state: Arc<AppState>,
 ) {
-    let mut poll_interval = interval(Duration::from_millis(500)); // Опрашиваем каждые 500 мс
+    let mut poll_interval = interval(Duration::from_millis(500));
 
     loop {
         tokio::select! {
@@ -122,136 +116,130 @@ async fn track_order(
                     OrderType::Futures => api_client.get_futures_order(&req.symbol, &req.order_id).await,
                 };
 
-                if let Ok(order_info) = check_result {
-                    if order_info.status == "filled" {
-                        let execution_time = chrono::Utc::now().timestamp_millis();
+                match check_result {
+                    Ok(order_info) => {
+                        if order_info.status == "filled" || order_info.status == "partially_filled" {
+                            info!("[OrderTracker] Order {} for {} {}. (clientOid: {})", &req.order_id, &req.symbol, order_info.status.to_uppercase(), &req.client_oid);
 
-                        info!("[OrderTracker] Order {} for {} FILLED. (clientOid: {})", &req.order_id, &req.symbol, &req.client_oid);
-                        
-                        let filled_event = OrderFilledEvent {
-                            symbol: req.symbol.clone(),
-                            order_id: req.order_id.clone(),
-                            order_type: req.order_type,
-                            avg_price: order_info.price_avg.clone(),
-                            base_volume: order_info.base_volume.clone(),
-                            quote_volume: order_info.quote_volume.clone(),
-                            client_oid: req.client_oid.clone(),
-                            context: req.context,
-                        };
-                        
-                        // --- Шаг 1: Запись данных T4 ---
-                        // Мы делаем это только для ордеров на вход, так как "черный ящик" создается только для них.
-                        if req.context == OrderContext::Entry { // Убеждаемся, что это ордер на вход
-                            // --- НАЧАЛО НОВОГО БЛОКА: ДЕЛАЕМ СНИМОК T4 ---
-                            let mut snapshot_t4 = MarketSnapshot::default();
-                            if let Some(pair_data) = app_state.inner.market_data.get(&req.symbol) {
-                                // Используем функцию из algorithm.rs для форматирования.
-                                // Примечание: в идеале эта функция должна быть в utils.
-                                let bids_str = crate::algorithm::format_levels_for_analysis(&pair_data.futures_book.bids, true, 5);
-                                let asks_str = crate::algorithm::format_levels_for_analysis(&pair_data.spot_book.asks, false, 5);
-                                snapshot_t4.timestamp = execution_time;
-                                snapshot_t4.futures_bids = bids_str;
-                                snapshot_t4.spot_asks = asks_str;
-                            }
+                            // --- НОВАЯ ЛОГИКА MAKER-TAKER ---
+                            if req.is_maker && req.context == OrderContext::Entry {
+                                // Это наш "якорный" Maker ордер исполнился!
+                                // Теперь нужно немедленно отправить Taker ордер на спот.
+                                let base_volume = Decimal::from_str(&order_info.base_volume).unwrap_or_default();
+                                if !base_volume.is_zero() {
+                                    info!("[MakerTaker] Maker leg filled for {}. Executing Taker leg on SPOT.", req.symbol);
+                                    let taker_req = PlaceOrderRequest {
+                                        symbol: req.symbol.clone(),
+                                        side: "buy".to_string(),
+                                        order_type: "market".to_string(),
+                                        force: "gtc".to_string(),
+                                        size: (base_volume * Decimal::from_str(&order_info.price_avg).unwrap_or_default() * dec!(1.01)).to_string(), // Покупаем на 1% больше USDT, чтобы покрыть slippage
+                                        client_oid: Some(req.client_oid.clone()),
+                                    };
 
-                            if let Some(log_entry) = app_state.inner.trade_analysis_logs.get(&req.client_oid) {
-                                let execution_details = match req.order_type {
-                                    OrderType::Spot => {
-                                        // Для спота используем quote_volume, это и есть стоимость (Cost).
-                                        let cost_str = order_info.quote_volume.as_deref().unwrap_or("0");
-                                        format!(
-                                            "Filled: {} @ {} | Cost: {}",
-                                            order_info.base_volume, order_info.price_avg, cost_str
-                                        )
-                                    },
-                                    OrderType::Futures => {
-                                        // Для фьючерсов ВЫЧИСЛЯЕМ выручку (Revenue), т.к. quote_volume ненадежен.
-                                        let price = Decimal::from_str(&order_info.price_avg).unwrap_or_default();
-                                        let qty = Decimal::from_str(&order_info.base_volume).unwrap_or_default();
-                                        let revenue = price * qty;
-                                        format!(
-                                            "Filled: {} @ {} | Revenue: {:.4}",
-                                            order_info.base_volume, order_info.price_avg, revenue
-                                        )
+                                    match api_client.place_spot_order(taker_req).await {
+                                        Ok(taker_order) => {
+                                            info!("[MakerTaker] Taker SPOT order placed for {}: ID {}", req.symbol, taker_order.order_id);
+                                            // Мы не отслеживаем Taker ордер отдельно, так как он рыночный и исполнится быстро.
+                                            // PositionManager все равно получит событие FILLED по нему.
+                                        },
+                                        Err(e) => {
+                                            error!("[MakerTaker] CRITICAL: Failed to place Taker SPOT order for {}: {:?}. MANUAL INTERVENTION REQUIRED!", req.symbol, e);
+                                            // TODO: Отправить в компенсатор задачу на закрытие только что открытой фьючерсной позиции
+                                        }
                                     }
-                                };
-                                // Записываем детали исполнения в лог
-                                log_entry.execution_logs.insert(req.order_id.clone(), (execution_time, execution_details.clone(), snapshot_t4));
-
-                                // --- Шаг 2: Проверка на завершение ---
-                                if log_entry.execution_logs.len() >= 2 { // Если оба ордера (спот и фьючерс) исполнены
-                                    info!("[Analysis] Both legs filled for clientOid {}. Generating analysis report.", req.client_oid);
-                                    // --- Шаг 3: Генерация отчета ---
-                                    generate_final_report(log_entry.value());
-                                    // Удаляем запись, чтобы очистить память
-                                    app_state.inner.trade_analysis_logs.remove(&req.client_oid);
                                 }
                             }
-                        }
+                            
+                            let filled_event = OrderFilledEvent {
+                                symbol: req.symbol.clone(), order_id: req.order_id.clone(), order_type: req.order_type,
+                                avg_price: order_info.price_avg.clone(), base_volume: order_info.base_volume.clone(),
+                                quote_volume: order_info.quote_volume.clone(), client_oid: req.client_oid.clone(), context: req.context,
+                            };
 
-                        // --- Шаг 4: Отправка события ---
-                        // Отправляем событие в PositionManager в любом случае, чтобы он мог обновить состояние позиции.
-                        if !send_cancellable(&order_filled_tx, filled_event, &shutdown).await {
-                            error!("[OrderWatcher] Failed to send OrderFilledEvent for order {} to PositionManager (channel closed or shutdown).", &req.order_id);
+                            process_filled_order(&req, &order_info, &app_state);
+
+                            if !send_cancellable(&order_filled_tx, filled_event, &shutdown).await {
+                                error!("[OrderWatcher] Failed to send OrderFilledEvent for order {}", &req.order_id);
+                            }
+
+                            if order_info.status == "filled" {
+                                break; // Выходим из цикла, если ордер исполнен полностью
+                            }
+                        } else if order_info.status == "cancelled" {
+                            info!("[OrderTracker] Order {} for {} was CANCELLED. Stopping tracking.", &req.order_id, &req.symbol);
+                            break;
                         }
-                        
-                        break;
-                    } else if order_info.status == "partially_filled" {
-                        // TODO: Handle partially filled orders if needed for the strategy.
-                        // For now, we just log and continue polling.
-                        info!("[OrderTracker] Order {} for {} is PARTIALLY_FILLED. Continuing to track.", &req.order_id, &req.symbol);
-                    } else if order_info.status == "cancelled" {
-                        info!("[OrderTracker] Order {} for {} was CANCELLED. Stopping tracking.", &req.order_id, &req.symbol);
+                    },
+                    Err(e) => {
+                        warn!("[OrderTracker] Failed to get order info for {}: {:?}. It might have been cancelled. Stopping tracking.", req.order_id, e);
                         break;
                     }
-                } else {
-                    // If the order is not found, it might have been cancelled and removed from the exchange's history quickly.
-                    // Or there could be a temporary API issue. We'll log a warning and stop tracking to avoid an infinite loop.
-                    warn!("[OrderTracker] Failed to get order info for {}. It might have been cancelled. Stopping tracking.", req.order_id);
-                    break;
                 }
             }
         }
     }
 }
 
-/// Формирует и записывает в файл `logs/analysis.log` финальный отчет по сделке.
-fn generate_final_report(log: &TradeAnalysisLog) {
+fn process_filled_order(
+    req: &WatchOrderRequest,
+    order_info: &crate::api_client::OrderInfo,
+    app_state: &Arc<AppState>,
+) {
+    if req.context != OrderContext::Entry { return; }
+
+    let execution_time = Utc::now().timestamp_millis();
+    let mut snapshot_t4 = MarketSnapshot::default();
+    if let Some(pair_data) = app_state.inner.market_data.get(&req.symbol) {
+        snapshot_t4 = MarketSnapshot {
+            timestamp: execution_time,
+            futures_bids: crate::algorithm::format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
+            spot_asks: crate::algorithm::format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
+        };
+    }
+
+    if let Some(log_entry) = app_state.inner.trade_analysis_logs.get(&req.client_oid) {
+        let details = match req.order_type {
+            OrderType::Spot => {
+                let cost = order_info.quote_volume.as_deref().unwrap_or("0");
+                format!("Filled: {} @ {} | Cost: {}", order_info.base_volume, order_info.price_avg, cost)
+            },
+            OrderType::Futures => {
+                let price = Decimal::from_str(&order_info.price_avg).unwrap_or_default();
+                let qty = Decimal::from_str(&order_info.base_volume).unwrap_or_default();
+                format!("Filled: {} @ {} | Revenue: {:.4}", qty, price, price * qty)
+            }
+        };
+
+        log_entry.execution_logs.insert(req.order_id.clone(), (execution_time, details, snapshot_t4));
+
+        if log_entry.execution_logs.len() >= 2 {
+            info!("[Analysis] Both legs filled for clientOid {}. Generating analysis report.", req.client_oid);
+            generate_final_report(log_entry.value());
+            app_state.inner.trade_analysis_logs.remove(&req.client_oid);
+        }
+    }
+}
+
+fn generate_final_report(log: &crate::types::TradeAnalysisLog) {
     let mut report = String::new();
-
-    let t1_dt = chrono::DateTime::from_timestamp_millis(log.snapshot_at_decision.timestamp).unwrap().with_timezone(&Local);
-    let t2_dt = chrono::DateTime::from_timestamp_millis(log.snapshot_before_send.timestamp).unwrap().with_timezone(&Local);
-    let t3_dt = chrono::DateTime::from_timestamp_millis(log.snapshot_at_acceptance.timestamp).unwrap().with_timezone(&Local);
-
-    let t2_delay = log.snapshot_before_send.timestamp - log.snapshot_at_decision.timestamp;
-    let t3_delay = log.snapshot_at_acceptance.timestamp - log.snapshot_at_decision.timestamp;
-
-    report.push_str(&format!(
-        "\n--- TRADE ANALYSIS [{}] clientOid: {} ---\n",
-        log.symbol, log.client_oid
-    ));
-
-    report.push_str(&format!(
-        "[T1: DECISION @ {}]\n",
-        t1_dt.format("%H:%M:%S%.3f")
-    ));
+    let t1_dt = Local.timestamp_millis_opt(log.snapshot_at_decision.timestamp).unwrap();
+    let t2_dt = Local.timestamp_millis_opt(log.snapshot_before_send.timestamp).unwrap();
+    let t3_dt = Local.timestamp_millis_opt(log.snapshot_at_acceptance.timestamp).unwrap();
+    
+    report.push_str(&format!("\n--- TRADE ANALYSIS [{}] clientOid: {} ---\n", log.symbol, log.client_oid));
+    report.push_str(&format!("[T1: DECISION @ {}]\n", t1_dt.format("%H:%M:%S%.3f")));
     report.push_str(&format!("  ├─ Simulation: {}\n", log.simulation_log));
     report.push_str("  └─ Market State:\n");
     report.push_str(&format!("      ├─ Futures Bids: {}\n", log.snapshot_at_decision.futures_bids));
     report.push_str(&format!("      └─ Spot Asks:    {}\n\n", log.snapshot_at_decision.spot_asks));
 
-    report.push_str(&format!(
-        "[T2: BEFORE SEND @ {} (+{}ms)]\n",
-        t2_dt.format("%H:%M:%S%.3f"), t2_delay
-    ));
+    report.push_str(&format!("[T2: BEFORE SEND @ {} (+{}ms)]\n", t2_dt.format("%H:%M:%S%.3f"), (t2_dt - t1_dt).num_milliseconds()));
     report.push_str("  └─ Market State:\n");
     report.push_str(&format!("      ├─ Futures Bids: {}\n", log.snapshot_before_send.futures_bids));
     report.push_str(&format!("      └─ Spot Asks:    {}\n\n", log.snapshot_before_send.spot_asks));
 
-    report.push_str(&format!(
-        "[T3: ACCEPTED by Exchange @ {} (+{}ms)]\n",
-        t3_dt.format("%H:%M:%S%.3f"), t3_delay
-    ));
+    report.push_str(&format!("[T3: ACCEPTED by Exchange @ {} (+{}ms)]\n", t3_dt.format("%H:%M:%S%.3f"), (t3_dt - t1_dt).num_milliseconds()));
     report.push_str("  └─ Market State:\n");
     report.push_str(&format!("      ├─ Futures Bids: {}\n", log.snapshot_at_acceptance.futures_bids));
     report.push_str(&format!("      └─ Spot Asks:    {}\n\n", log.snapshot_at_acceptance.spot_asks));
@@ -262,73 +250,42 @@ fn generate_final_report(log: &TradeAnalysisLog) {
     let mut futures_revenue = Decimal::ZERO;
 
     for leg in log.execution_logs.iter() {
-        let order_id = leg.key();
         let (exec_time, details, snapshot_t4) = leg.value();
-        let exec_dt = chrono::DateTime::from_timestamp_millis(*exec_time).unwrap().with_timezone(&Local); // No change needed here
-        let exec_delay = *exec_time - log.snapshot_at_acceptance.timestamp;
+        let exec_dt = Local.timestamp_millis_opt(*exec_time).unwrap();
+        let leg_type = if details.contains("Cost") { "SPOT" } else { "FUTURES" };
 
-        // Пытаемся определить тип лега по деталям
-        let leg_type = if details.contains("Cost") { "SPOT" } else if details.contains("Revenue") { "FUTURES" } else { "UNKNOWN" };
-
-        report.push_str(&format!(
-            "  ├─ {} Leg (orderId: {}...):\n",
-            leg_type,
-            &order_id[..8]
-        ));
-        report.push_str(&format!(
-            "  │   ├─ Executed @ {} (Delay: {}ms) | {}\n",
-            exec_dt.format("%H:%M:%S%.3f"),
-            exec_delay,
-            details
-        ));
+        report.push_str(&format!("  ├─ {} Leg (orderId: {}...):\n", leg_type, &leg.key()[..8]));
+        report.push_str(&format!("  │   ├─ Executed @ {} (Delay: {}ms) | {}\n", exec_dt.format("%H:%M:%S%.3f"), (*exec_time - log.snapshot_at_acceptance.timestamp), details));
         report.push_str("  │   └─ Market State @ Execution:\n");
         report.push_str(&format!("  │       ├─ Futures Bids: {}\n", snapshot_t4.futures_bids));
         report.push_str(&format!("  │       └─ Spot Asks:    {}\n", snapshot_t4.spot_asks));
 
-
-        // Для финального анализа
         if leg_type == "SPOT" {
-            if let Some(cost_str) = details.split("Cost: ").last().and_then(|s| s.split_whitespace().next()) {
-                spot_cost = Decimal::from_str(cost_str.trim()).unwrap_or_default();
-            }
-        } else if leg_type == "FUTURES" {
-            if let Some(rev_str) = details.split("Revenue: ").last().and_then(|s| s.split_whitespace().next()) {
-                futures_revenue = Decimal::from_str(rev_str.trim()).unwrap_or_default();
-            }
+            if let Some(val) = details.split("Cost: ").last() { spot_cost = Decimal::from_str(val.trim()).unwrap_or_default(); }
+        } else {
+            if let Some(val) = details.split("Revenue: ").last() { futures_revenue = Decimal::from_str(val.trim()).unwrap_or_default(); }
         }
     }
 
-    // --- ANALYSIS SECTION ---
     let mut sim_fut_rev = Decimal::ZERO;
     let mut sim_spot_cost = Decimal::ZERO;
     for part in log.simulation_log.split(" | ") {
-        if let Some(val_str) = part.strip_prefix("R_fut: ") {
-            sim_fut_rev = Decimal::from_str(val_str).unwrap_or_default();
-        }
-        if let Some(val_str) = part.strip_prefix("C_spot: ") {
-            sim_spot_cost = Decimal::from_str(val_str).unwrap_or_default();
-        }
+        if let Some(val) = part.strip_prefix("R_fut: ") { sim_fut_rev = Decimal::from_str(val.trim()).unwrap_or_default(); }
+        if let Some(val) = part.strip_prefix("C_spot: ") { sim_spot_cost = Decimal::from_str(val.trim()).unwrap_or_default(); }
     }
 
-    let sim_entry_spread_usdt = sim_fut_rev - sim_spot_cost;
-    let actual_entry_spread_usdt = futures_revenue - spot_cost;
-    let slippage = actual_entry_spread_usdt - sim_entry_spread_usdt;
-
+    let sim_pnl = sim_fut_rev - sim_spot_cost;
+    let actual_pnl = futures_revenue - spot_cost;
+    
     report.push_str("\n--- ANALYSIS ---\n");
-    report.push_str(&format!("- Simulated Entry Spread: {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", sim_entry_spread_usdt, sim_fut_rev, sim_spot_cost));
-    report.push_str(&format!("- Actual Entry Spread:    {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", actual_entry_spread_usdt, futures_revenue, spot_cost));
-    report.push_str(&format!("- Slippage on Entry:      {:.4} USDT\n", slippage));
-    if slippage < Decimal::ZERO {
-        report.push_str("- Diagnosis: Negative slippage indicates that the market moved against the trade between decision and execution.\n");
-    }
-    report.push_str("\n--- END OF REPORT ---\n");
+    report.push_str(&format!("- Simulated PnL: {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", sim_pnl, sim_fut_rev, sim_spot_cost));
+    report.push_str(&format!("- Actual PnL:    {:.4} USDT (Revenue: {:.4} - Cost: {:.4})\n", actual_pnl, futures_revenue, spot_cost));
+    report.push_str(&format!("- Slippage:      {:.4} USDT\n", actual_pnl - sim_pnl));
+    report.push_str("- Diagnosis: Negative slippage indicates that the market moved against the trade between decision and execution.\n\n--- END OF REPORT ---\n");
 
-    // Запись в файл
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("logs/analysis.log") {
         if let Err(e) = writeln!(file, "{}", report) {
             error!("[Analysis] Failed to write to analysis.log: {}", e);
         }
-    } else {
-        error!("[Analysis] Failed to open or create logs/analysis.log");
     }
 }
