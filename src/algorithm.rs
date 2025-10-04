@@ -395,8 +395,6 @@ async fn execute_maker_taker_entry_task(
                 break; // Выходим из цикла при завершении работы
             },
             _ = tokio::time::sleep(chase_throttle) => {
-                if last_chase_time.elapsed() < chase_throttle { continue; }
-                last_chase_time = Instant::now();
 
                 // Проверяем, не создалась ли уже позиция (т.е. ордер исполнился)
                 if app_state.inner.active_positions.contains_key(&symbol) {
