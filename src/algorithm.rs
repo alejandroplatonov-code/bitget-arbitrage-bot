@@ -377,11 +377,11 @@ async fn execute_maker_taker_entry_task(
 
     // Таймер, который запускается только когда спред становится невыгодным.
     let mut unfavorable_spread_timer: Option<Instant> = None;
-    let task_timeout = Duration::from_secs(120); // Таймаут в 2 минуты
-    let mut last_chase_time = Instant::now();
-    let chase_throttle = Duration::from_millis(500); // Не чаще чем раз в 500 мс
+    let unfavorable_timeout = Duration::from_secs(120); // Таймаут в 2 минуты
+    let chase_throttle = Duration::from_millis(500);
     let mut current_maker_order_id: Option<String> = None;
 
+    let mut interval = tokio::time::interval(chase_throttle);
     loop {
         tokio::select! {
             biased;
@@ -394,7 +394,7 @@ async fn execute_maker_taker_entry_task(
                 }
                 break; // Выходим из цикла при завершении работы
             },
-            _ = tokio::time::sleep(chase_throttle) => {
+            _ = interval.tick() => {
 
                 // Проверяем, не создалась ли уже позиция (т.е. ордер исполнился)
                 if app_state.inner.active_positions.contains_key(&symbol) {
@@ -420,8 +420,8 @@ async fn execute_maker_taker_entry_task(
                 if current_spread < config.spread_threshold_percent {
                     // Спред невыгодный, запускаем или проверяем таймер
                     let timer = unfavorable_spread_timer.get_or_insert_with(Instant::now);
-                    if timer.elapsed() >= task_timeout {
-                        info!("[MakerTaker] Task for {} timed out. Spread has been unfavorable for over {} seconds. Current spread: {:.4}%. Cancelling chase.", symbol, task_timeout.as_secs(), current_spread);
+                    if timer.elapsed() >= unfavorable_timeout {
+                        info!("[MakerTaker] Task for {} timed out. Spread has been unfavorable for over {} seconds. Current spread: {:.4}%. Cancelling chase.", symbol, unfavorable_timeout.as_secs(), current_spread);
                         if current_maker_order_id.is_some() {
                             if let Err(e) = api_client.cancel_futures_order_by_client_oid(&symbol, &client_oid).await {
                                 warn!("[MakerTaker] Failed to cancel maker order on timeout for {}: {:?}", symbol, e);
