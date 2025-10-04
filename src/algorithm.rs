@@ -5,11 +5,16 @@ use crate::config::Config;
 use crate::order_watcher::{OrderType, WatchOrderRequest};
 use crate::state::AppState;
 use crate::trading_logic;
-use crate::types::{ActivePosition, ArbitrageDirection, CompensationTask, MarketSnapshot, PairData, TradeAnalysisLog, TradingStatus};
+use crate::types::{
+    ActivePosition, ArbitrageDirection, CompensationTask, MarketSnapshot, PairData,
+    TradeAnalysisLog, TradingStatus,
+};
 use crate::utils::send_cancellable;
+use chrono::Utc;
 use rust_decimal::Decimal;
+use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::atomic::{Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -29,7 +34,6 @@ pub async fn run_trading_algorithm(
     loop {
         tokio::select! {
             Some(symbol) = orderbook_update_rx.recv() => {
-                // Throttle checks for a given symbol to avoid redundant processing.
                 let throttle_duration = Duration::from_millis(config.throttle_ms);
                 if let Some(last_check_time) = app_state.inner.last_checked.get(&symbol) {
                     if last_check_time.elapsed() < throttle_duration {
@@ -38,7 +42,6 @@ pub async fn run_trading_algorithm(
                 }
                 app_state.inner.last_checked.insert(symbol.clone(), Instant::now());
 
-                // Spawn a task to handle the logic for this symbol off the hot path.
                 tokio::spawn({
                     let app_state = app_state.clone();
                     let config = config.clone();
@@ -51,8 +54,7 @@ pub async fn run_trading_algorithm(
                             handle_open_position(&symbol, position, app_state, config, api_client, order_watch_tx, compensation_tx, shutdown).await;
                         } else {
                             if let Some(pair_data) = app_state.inner.market_data.get(&symbol) {
-                                let app_state_clone = app_state.clone();
-                                handle_unopened_pair(symbol, pair_data.value().clone(), app_state_clone, config, api_client, order_watch_tx, compensation_tx, shutdown).await;
+                                handle_unopened_pair(symbol, pair_data.value().clone(), app_state.clone(), config, api_client, order_watch_tx, compensation_tx, shutdown).await;
                             }
                         }
                     }
@@ -64,7 +66,6 @@ pub async fn run_trading_algorithm(
             }
         }
 
-        // Check for graceful stop condition.
         let status = app_state.inner.trading_status.load(Ordering::SeqCst);
         if status == TradingStatus::Stopping as u8 && app_state.inner.active_positions.is_empty() {
             info!("[Algorithm] Graceful stop complete. Shutting down.");
@@ -75,7 +76,6 @@ pub async fn run_trading_algorithm(
     info!("[Algorithm] Service has shut down.");
 }
 
-/// Handles an open position: checks for exit conditions and executes the closing trade.
 async fn handle_open_position(
     symbol: &str,
     _position: ActivePosition,
@@ -90,7 +90,6 @@ async fn handle_open_position(
         return;
     }
 
-    // --- STAGE 1: Concurrently fetch actual spot balance and futures position size ---
     let base_coin = symbol.replace("USDT", "");
     let (spot_balance_res, futures_pos_res) = tokio::join!(
         api_client.get_spot_balance(&base_coin),
@@ -109,20 +108,14 @@ async fn handle_open_position(
         }
     };
 
-    // --- STAGE 2: Determine the safe quantity to close ---
-    // This is the core of the safety mechanism. We can only close the minimum of what we have on both legs.
     let close_quantity = actual_spot_balance.min(actual_futures_position);
 
-    // --- STAGE 3: Check if the safe quantity is above the dust threshold ---
     let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
-    // Using a safe fallback for min_trade_amount, though it should be fetched from the API.
     let min_trade_qty = rules.min_trade_amount.unwrap_or_else(|| Decimal::from_str("0.0001").unwrap());
     if close_quantity < min_trade_qty {
-        // The tradeable amount is too small (dust), nothing to do.
         return;
     }
 
-    // --- STAGE 4: Simulate the exit trade using the SAFE quantity ---
     let pair_data = match app_state.inner.market_data.get(symbol) {
         Some(data) => data.clone(),
         None => return,
@@ -146,7 +139,7 @@ async fn handle_open_position(
             actual_futures_position,
             exit_spread_percent
         );
-        // --- STAGE 5: Make a decision based on the simulation ---
+        
         let close_reason = if app_state.inner.force_close_requests.remove(symbol).is_some() {
             Some("Force Closed by User")
         } else if r_exit_res.total_quote_qty >= c_exit_res.total_quote_qty {
@@ -155,7 +148,6 @@ async fn handle_open_position(
             None
         };
 
-        // --- STAGE 6: Execute if a decision was made ---
         if let Some(reason) = close_reason {
             if !app_state.inner.executing_pairs.insert(symbol.to_string()) { return; }
             info!("[{}] EXIT TRIGGERED. Reason: {}. Safe Close Qty: {}. Spot Balance: {}, Futures Pos: {}. Sim Exit Revenue: {:.4}, Sim Exit Cost: {:.4}",
@@ -175,38 +167,25 @@ async fn handle_open_position(
                         .unwrap_or_default();
                     let client_oid = uuid::Uuid::new_v4().to_string();
 
-                    // --- Apply individual rounding rules to the safe quantity ---
                     let spot_quantity_scale = rules.spot_quantity_scale.unwrap_or(2);
                     let futures_quantity_scale = rules.futures_quantity_scale.unwrap_or(4);
 
                     let spot_close_qty = close_quantity.trunc_with_scale(spot_quantity_scale);
                     let futures_close_qty = close_quantity.trunc_with_scale(futures_quantity_scale);
 
-                    // Place Spot Sell Order
                     let spot_task = {
                         let req = PlaceOrderRequest {
-                            symbol: symbol.clone(),
-                            side: "sell".to_string(),
-                            order_type: "market".to_string(),
-                            force: "gtc".to_string(),
-                            size: spot_close_qty.to_string(),
-                            client_oid: Some(client_oid.clone()),
+                            symbol: symbol.clone(), side: "sell".to_string(), order_type: "market".to_string(),
+                            force: "gtc".to_string(), size: spot_close_qty.to_string(), client_oid: Some(client_oid.clone()),
                         };
                         client.place_spot_order(req)
                     };
 
-                    // Place Futures Buy (to close short) Order
                     let fut_task = {
                         let req = PlaceFuturesOrderRequest {
-                            symbol: symbol.clone(),
-                            product_type: "USDT-FUTURES".to_string(),
-                            margin_mode: "isolated".to_string(),
-                            margin_coin: "USDT".to_string(),
-                            size: futures_close_qty.to_string(),
-                            side: "buy".to_string(),
-                            trade_side: None,
-                            order_type: "market".to_string(),
-                            client_oid: Some(client_oid.clone()),
+                            symbol: symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(),
+                            margin_coin: "USDT".to_string(), size: futures_close_qty.to_string(), side: "buy".to_string(),
+                            trade_side: None, order_type: "market".to_string(), client_oid: Some(client_oid.clone()),
                         };
                         client.place_futures_order(req)
                     };
@@ -242,7 +221,6 @@ async fn handle_open_position(
     }
 }
 
-/// Handles a pair with no open position: checks limits and spawns an execution task if profitable.
 async fn handle_unopened_pair(
     symbol: String,
     pair_data: PairData,
@@ -254,31 +232,34 @@ async fn handle_unopened_pair(
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     if app_state.inner.trading_status.load(Ordering::SeqCst) == TradingStatus::Stopping as u8 { return; }
-    let active_count = app_state.inner.active_positions.len();
-    let executing_count = app_state.inner.executing_pairs.len();
-    if (active_count + executing_count) >= config.max_active_positions { return; }
+    if (app_state.inner.active_positions.len() + app_state.inner.executing_pairs.len()) >= config.max_active_positions { return; }
     if app_state.inner.executing_pairs.contains(&symbol) { return; }
 
     check_and_execute_arbitrage(&symbol, &pair_data, app_state, config, api_client, order_watch_tx, compensation_tx, shutdown);
 }
 
-/// Форматирует детализацию уровней стакана для логирования.
-fn format_levels(levels: &[crate::trading_logic::TradeExecutionDetail]) -> String {
+// --- ИЗМЕНЕНИЕ: Новая универсальная функция-хелпер ---
+fn format_levels_for_analysis(book: &BTreeMap<Decimal, Decimal>, reverse: bool, limit: usize) -> String {
+    let mut items = Vec::new();
+    if reverse {
+        for (p, q) in book.iter().rev().take(limit) {
+            items.push(format!("(P:{}, Q:{})", p, q));
+        }
+    } else {
+        for (p, q) in book.iter().take(limit) {
+            items.push(format!("(P:{}, Q:{})", p, q));
+        }
+    }
+    items.join(" | ")
+}
+
+fn format_levels_from_details(levels: &[crate::trading_logic::TradeExecutionDetail]) -> String {
     levels.iter()
         .map(|detail| format!("(P:{:.8}, Q:{:.4})", detail.price, detail.qty))
         .collect::<Vec<_>>()
         .join(" | ")
 }
 
-/// Форматирует N уровней стакана для лога анализа.
-fn format_levels_for_analysis(levels: &[(Decimal, Decimal)]) -> String {
-    levels.iter()
-        .map(|(price, qty)| format!("(P:{}, Q:{})", price, qty))
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-/// Synchronously checks for an arbitrage opportunity and spawns a background task to execute it.
 fn check_and_execute_arbitrage(
     symbol: &str,
     pair_data: &PairData,
@@ -289,8 +270,7 @@ fn check_and_execute_arbitrage(
     compensation_tx: mpsc::Sender<CompensationTask>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
-    // Мы собираемся ПРОДАТЬ фьючерсы, поэтому для расчета объема берем лучшую цену BID.
-    let last_price = match pair_data.futures_book.bids.iter().rev().next() { // .rev() чтобы взять самую высокую цену bid
+    let last_price = match pair_data.futures_book.bids.iter().rev().next() {
         Some((&price, _)) if !price.is_zero() => price,
         _ => return,
     };
@@ -306,44 +286,42 @@ fn check_and_execute_arbitrage(
         if spread_percent >= config.spread_threshold_percent {
             if !app_state.inner.executing_pairs.insert(symbol.to_string()) { return; }
 
-            // --- ЧАСТЬ 1: ЛОГИРОВАНИЕ СТАКАНОВ ДЛЯ АУДИТА ---
-            // Это сообщение будет направлено в отдельный файл (orderbooks.log)
-            info!(
-                target: "orderbook_logger",
-                "[{symbol}] Snapshot for spread {spread:.4}%:\n  ├─ FUTURES BIDS: {f_bids}\n  └─ SPOT ASKS:    {s_asks}",
-                symbol = symbol,
-                spread = spread_percent,
-                f_bids = format_levels_for_analysis(&pair_data.futures_book.bids.iter().rev().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
-                s_asks = format_levels_for_analysis(&pair_data.spot_book.asks.iter().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>())
-            );
-
-            // --- ОСНОВНОЙ ЛОГ О СРАБАТЫВАНИИ ---
-            // Это сообщение пойдет в основной лог (bot.log) и в консоль
-
-            // --- ЧАСТЬ 2: СБОР ДАННЫХ T1 ---
             let client_oid = uuid::Uuid::new_v4().to_string();
+
+            // --- ИЗМЕНЕНИЕ: Собираем "черный ящик" (T1) ---
             let simulation_log_str = format!(
                 "Gross Spread: {spread:.4}% | R_fut: {f_rev:.4}, C_spot: {s_cost:.4}",
                 spread = spread_percent,
                 f_rev = sell_futures_res.total_quote_qty,
                 s_cost = buy_spot_res.total_quote_qty
             );
+            
+            let snapshot_t1 = MarketSnapshot {
+                timestamp: Utc::now().timestamp_millis(),
+                futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
+                spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
+            };
 
             let analysis_log = TradeAnalysisLog {
                 symbol: symbol.to_string(),
                 client_oid: client_oid.clone(),
                 simulation_log: simulation_log_str,
-                snapshot_at_decision: MarketSnapshot {
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids.iter().rev().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
-                    spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks.iter().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
-                },
+                snapshot_at_decision: snapshot_t1,
                 ..Default::default()
             };
+            app_state.inner.trade_analysis_logs.insert(client_oid.clone(), analysis_log);
 
-            let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
-            let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
-            let rounded_futures_qty = base_qty_n.trunc_with_scale(fut_scale);
+            // Логируем в отдельный файл для аудита
+            info!(
+                target: "orderbook_logger",
+                "[{symbol}] Snapshot for spread {spread:.4}%:\n  ├─ FUTURES BIDS: {f_bids}\n  └─ SPOT ASKS:    {s_asks}",
+                symbol = symbol,
+                spread = spread_percent,
+                f_bids = format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
+                s_asks = format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
+            );
+
+            // Логируем основной результат симуляции
             info!(
                 "[{symbol}]: ENTRY TRIGGERED. Gross Spread: {spread}\n  ├─ SELL FUTURES (Sim): Qty:{f_qty:.4}, VWAP:{f_vwap:.8}, Revenue:{f_rev:.4} USDT\n  │   └─ Levels: {f_levels}\n  └─ BUY SPOT (Sim):     Qty:{s_qty:.4}, VWAP:{s_vwap:.8}, Cost:{s_cost:.4} USDT\n      └─ Levels: {s_levels}",
                 symbol = symbol,
@@ -351,15 +329,16 @@ fn check_and_execute_arbitrage(
                 f_qty = sell_futures_res.total_base_qty,
                 f_vwap = sell_futures_res.vwap,
                 f_rev = sell_futures_res.total_quote_qty,
-                f_levels = format_levels(&sell_futures_res.levels_consumed),
+                f_levels = format_levels_from_details(&sell_futures_res.levels_consumed),
                 s_qty = buy_spot_res.total_base_qty,
                 s_vwap = buy_spot_res.vwap,
                 s_cost = buy_spot_res.total_quote_qty,
-                s_levels = format_levels(&buy_spot_res.levels_consumed)
+                s_levels = format_levels_from_details(&buy_spot_res.levels_consumed)
             );
 
-            // Вставляем лог в хранилище
-            app_state.inner.trade_analysis_logs.insert(client_oid.clone(), analysis_log);
+            let rules = app_state.inner.symbol_rules.get(symbol).map(|r| *r.value()).unwrap_or_default();
+            let fut_scale = rules.futures_quantity_scale.unwrap_or(4);
+            let rounded_futures_qty = base_qty_n.trunc_with_scale(fut_scale);
 
             if config.live_trading_enabled {
                 tokio::spawn(execute_entry_trade_task(
@@ -381,7 +360,6 @@ fn check_and_execute_arbitrage(
     }
 }
 
-/// Background task to place the entry orders.
 async fn execute_entry_trade_task(
     symbol: String,
     cost_spot_entry: Decimal,
@@ -398,45 +376,32 @@ async fn execute_entry_trade_task(
     const GLOBAL_PRICE_SCALE: u32 = 4;
     let rounded_spot_cost = cost_with_slippage.trunc_with_scale(GLOBAL_PRICE_SCALE);
 
-    // --- ЧАСТЬ 2: СБОР ДАННЫХ T2 ---
+    // --- ИЗМЕНЕНИЕ: Делаем снимок T2 ---
     if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
         if let Some(pair_data) = app_state.inner.market_data.get(&symbol) {
-            let snapshot = MarketSnapshot {
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids.iter().rev().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
-                spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks.iter().take(5).map(|(p,q)| (*p,*q)).collect::<Vec<_>>()),
+            let snapshot_t2 = MarketSnapshot {
+                timestamp: Utc::now().timestamp_millis(),
+                futures_bids: format_levels_for_analysis(&pair_data.futures_book.bids, true, 5),
+                spot_asks: format_levels_for_analysis(&pair_data.spot_book.asks, false, 5),
             };
-            analysis_log_entry.value_mut().snapshot_before_send = snapshot;
+            analysis_log_entry.value_mut().snapshot_before_send = snapshot_t2;
         }
-    } else {
-        warn!("[Analysis] Could not find TradeAnalysisLog for clientOid {} before sending orders.", client_oid);
     }
-
 
     let (spot_res, fut_res) = tokio::join!(
         async {
             let order = PlaceOrderRequest {
-                symbol: symbol.clone(),
-                side: "buy".to_string(),
-                order_type: "market".to_string(),
-                force: "gtc".to_string(),
-                size: rounded_spot_cost.to_string(),
-                client_oid: Some(client_oid.clone()),
+                symbol: symbol.clone(), side: "buy".to_string(), order_type: "market".to_string(),
+                force: "gtc".to_string(), size: rounded_spot_cost.to_string(), client_oid: Some(client_oid.clone()),
             };
             info!("[{}] SPOT ORDER REQUEST BODY: {}", symbol, serde_json::to_string(&order).unwrap_or_default());
             api_client.place_spot_order(order).await
         },
         async {
             let order = PlaceFuturesOrderRequest {
-                symbol: symbol.clone(),
-                product_type: "USDT-FUTURES".to_string(),
-                margin_mode: "isolated".to_string(),
-                margin_coin: "USDT".to_string(),
-                size: rounded_futures_qty.to_string(),
-                side: "sell".to_string(),
-                trade_side: None,
-                order_type: "market".to_string(),
-                client_oid: Some(client_oid.clone()),
+                symbol: symbol.clone(), product_type: "USDT-FUTURES".to_string(), margin_mode: "isolated".to_string(),
+                margin_coin: "USDT".to_string(), size: rounded_futures_qty.to_string(), side: "sell".to_string(),
+                trade_side: None, order_type: "market".to_string(), client_oid: Some(client_oid.clone()),
             };
             info!("[{}] FUTURES ORDER REQUEST BODY: {}", symbol, serde_json::to_string(&order).unwrap_or_default());
             api_client.place_futures_order(order).await
@@ -447,42 +412,32 @@ async fn execute_entry_trade_task(
         (Ok(spot_order), Ok(futures_order)) => {
             info!("[{}] ENTRY SUCCESS: Both entry orders placed. Spot ID: {}, Futures ID: {}", &symbol, &spot_order.order_id, &futures_order.order_id);
             
-            // --- ЧАСТЬ 2: СБОР ДАННЫХ T3 ---
+            // --- ИЗМЕНЕНИЕ: Записываем время T3 ---
             if let Some(mut analysis_log_entry) = app_state.inner.trade_analysis_logs.get_mut(&client_oid) {
-                analysis_log_entry.value_mut().timestamp_accepted = chrono::Utc::now().timestamp_millis();
-            } else {
-                warn!("[Analysis] Could not find TradeAnalysisLog for clientOid {} after orders were accepted.", client_oid);
+                analysis_log_entry.value_mut().timestamp_accepted = Utc::now().timestamp_millis();
             }
 
             let spot_req = WatchOrderRequest { symbol: symbol.clone(), order_id: spot_order.order_id, order_type: OrderType::Spot, client_oid: client_oid.clone(), context: crate::order_watcher::OrderContext::Entry };
             let fut_req = WatchOrderRequest { symbol: symbol.clone(), order_id: futures_order.order_id, order_type: OrderType::Futures, client_oid: client_oid, context: crate::order_watcher::OrderContext::Entry };
-            if !send_cancellable(&order_watch_tx, spot_req, &shutdown).await { /* Handle error */ }
-            if !send_cancellable(&order_watch_tx, fut_req, &shutdown).await { app_state.inner.executing_pairs.remove(&symbol); }
+            if !send_cancellable(&order_watch_tx, spot_req, &shutdown).await { error!("[{}] Failed to send spot watch request", symbol); }
+            if !send_cancellable(&order_watch_tx, fut_req, &shutdown).await { error!("[{}] Failed to send futures watch request", symbol); app_state.inner.executing_pairs.remove(&symbol); }
         },
         (Ok(spot_order), Err(e_fut)) => {
             error!("[{}] LEGGING RISK ON ENTRY (Futures Failed): {:?}. Delegating to compensator.", symbol, e_fut);
             let task = CompensationTask {
-                symbol: symbol.clone(),
-                original_order_id: spot_order.order_id,
-                base_qty_to_compensate: rounded_futures_qty, // This is correct, we need to compensate the *other* leg's quantity
-                original_direction: ArbitrageDirection::BuySpotSellFutures,
-                leg_to_compensate: OrderType::Spot, // This is correct, we need to compensate the *successful* leg
-                is_entry: true,
+                symbol: symbol.clone(), original_order_id: spot_order.order_id, base_qty_to_compensate: rounded_futures_qty,
+                original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Spot, is_entry: true,
             };
-            if !send_cancellable(&compensation_tx, task, &shutdown).await { /* Handle error */ }
+            if !send_cancellable(&compensation_tx, task, &shutdown).await { error!("[{}] CRITICAL: Failed to send compensation task for SPOT leg!", symbol); }
             app_state.inner.executing_pairs.remove(&symbol);
         },
         (Err(e_spot), Ok(futures_order)) => {
             error!("[{}] LEGGING RISK ON ENTRY (Spot Failed): {:?}. Delegating to compensator.", symbol, e_spot);
             let task = CompensationTask {
-                symbol: symbol.clone(),
-                original_order_id: futures_order.order_id,
-                base_qty_to_compensate: rounded_futures_qty,
-                original_direction: ArbitrageDirection::BuySpotSellFutures,
-                leg_to_compensate: OrderType::Futures, // This is correct, we need to compensate the *successful* leg
-                is_entry: true,
+                symbol: symbol.clone(), original_order_id: futures_order.order_id, base_qty_to_compensate: rounded_futures_qty,
+                original_direction: ArbitrageDirection::BuySpotSellFutures, leg_to_compensate: OrderType::Futures, is_entry: true,
             };
-            if !send_cancellable(&compensation_tx, task, &shutdown).await { /* Handle error */ }
+            if !send_cancellable(&compensation_tx, task, &shutdown).await { error!("[{}] CRITICAL: Failed to send compensation task for FUTURES leg!", symbol); }
             app_state.inner.executing_pairs.remove(&symbol);
         },
         (Err(e_spot), Err(e_fut)) => {

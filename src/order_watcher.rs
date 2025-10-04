@@ -136,21 +136,24 @@ async fn track_order(
                             context: req.context,
                         };
                         
-                        // --- ЧАСТЬ 3: СБОР ДАННЫХ T4 И ФИНАЛЬНЫЙ ОТЧЕТ ---
-                        if req.context == OrderContext::Entry {
-                            if let Some(log_entry) = app_state.inner.trade_analysis_logs.get(&req.client_oid) {
-                                let quote_vol_str = order_info.quote_volume.as_deref().unwrap_or("N/A");
-                                // Используем "Cost" или "Revenue" в зависимости от типа ордера для более точного отчета
+                        // --- Шаг 1: Запись данных T4 ---
+                        // Мы делаем это только для ордеров на вход, так как "черный ящик" создается только для них.
+                        if req.context == OrderContext::Entry { // Убеждаемся, что это ордер на вход
+                            if let Some(log_entry) = app_state.inner.trade_analysis_logs.get(&req.client_oid) { // Находим лог по clientOid
+                                let quote_vol_str = order_info.quote_volume.as_deref().unwrap_or("0");
+                                // Определяем, была ли это "стоимость" (покупка на споте) или "выручка" (продажа на фьючерсах)
                                 let vol_label = if req.order_type == OrderType::Spot { "Cost" } else { "Revenue" };
                                 let execution_details = format!(
                                     "Filled: {} @ {} | {}: {}",
                                     order_info.base_volume, order_info.price_avg, vol_label, quote_vol_str
                                 );
+                                // Записываем детали исполнения в лог
                                 log_entry.execution_logs.insert(req.order_id.clone(), (execution_time, execution_details));
 
-                                // Проверяем, исполнены ли оба ордера
-                                if log_entry.execution_logs.len() >= 2 {
+                                // --- Шаг 2: Проверка на завершение ---
+                                if log_entry.execution_logs.len() >= 2 { // Если оба ордера (спот и фьючерс) исполнены
                                     info!("[Analysis] Both legs filled for clientOid {}. Generating analysis report.", req.client_oid);
+                                    // --- Шаг 3: Генерация отчета ---
                                     generate_final_report(log_entry.value());
                                     // Удаляем запись, чтобы очистить память
                                     app_state.inner.trade_analysis_logs.remove(&req.client_oid);
@@ -158,8 +161,8 @@ async fn track_order(
                             }
                         }
 
-
-                        // Отправляем событие в PositionManager через MPSC канал
+                        // --- Шаг 4: Отправка события ---
+                        // Отправляем событие в PositionManager в любом случае, чтобы он мог обновить состояние позиции.
                         if !send_cancellable(&order_filled_tx, filled_event, &shutdown).await {
                             error!("[OrderWatcher] Failed to send OrderFilledEvent for order {} to PositionManager (channel closed or shutdown).", &req.order_id);
                         }
